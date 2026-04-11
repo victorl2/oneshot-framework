@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# oneshot-status
+#
+# Minimal remote status reader. Given a host and a remote run directory,
+# SSHes in and prints a one-shot summary of the run's state:
+#   - latest event type from status.jsonl
+#   - current phase and activity from current.json
+#   - elapsed time and tool-call count
+#
+# This is the smallest tool that can follow along with a dispatched run.
+# The future `/oneshot status` slash command will build on top of this to
+# scan all local projects and render a multi-run table.
+#
+# Usage:
+#   oneshot-status <host> <remote_run_dir>
+#
+# Required on the operator's machine: ssh, jq
+#
+# See DESIGN.md §5 (Progress Tracker).
+
+set -euo pipefail
+
+if [[ $# -lt 2 ]]; then
+  cat <<EOF >&2
+Usage: oneshot-status <host> <remote_run_dir>
+
+Example:
+  oneshot-status workstation.local /var/lib/oneshot/runs/r-20260410-143000
+EOF
+  exit 2
+fi
+
+HOST="$1"
+REMOTE_DIR="$2"
+
+# Fetch status.jsonl (semantic events) and current.json in a single SSH call
+# to minimize latency. If a file doesn't exist yet, we get an empty string.
+read_output="$(ssh "$HOST" bash -s <<EOF
+set -e
+run_dir='$REMOTE_DIR'
+printf '__STATUS_START__\n'
+[[ -f "\$run_dir/status.jsonl" ]] && cat "\$run_dir/status.jsonl"
+printf '__STATUS_END__\n'
+printf '__CURRENT_START__\n'
+[[ -f "\$run_dir/current.json" ]] && cat "\$run_dir/current.json"
+printf '__CURRENT_END__\n'
+EOF
+)"
+
+status_events="$(awk '/__STATUS_START__/{flag=1;next} /__STATUS_END__/{flag=0} flag' <<<"$read_output")"
+current_json="$(awk '/__CURRENT_START__/{flag=1;next} /__CURRENT_END__/{flag=0} flag' <<<"$read_output")"
+
+# Derive "last event type" from the last line of status.jsonl (if any).
+if [[ -n "$status_events" ]]; then
+  last_event="$(printf '%s\n' "$status_events" | tail -1)"
+  last_type="$(jq -r '.type // "unknown"' <<<"$last_event")"
+else
+  last_type="(no status.jsonl yet)"
+fi
+
+# Derive live state from current.json (if present).
+if [[ -n "$current_json" ]]; then
+  phase="$(jq -r '.phase // "unknown"' <<<"$current_json")"
+  act="$(jq -r '.act // "unknown"' <<<"$current_json")"
+  elapsed="$(jq -r '.e // 0' <<<"$current_json")"
+  tool_calls="$(jq -r '.tc // 0' <<<"$current_json")"
+  tokens="$(jq -r '.tk // 0' <<<"$current_json")"
+  files="$(jq -r '.ft // 0' <<<"$current_json")"
+  subagents_active="$(jq -r '.sa // 0' <<<"$current_json")"
+else
+  phase="(no current.json yet)"
+  act=""
+  elapsed=0
+  tool_calls=0
+  tokens=0
+  files=0
+  subagents_active=0
+fi
+
+# Count events per type for a compact summary.
+if [[ -n "$status_events" ]]; then
+  event_summary="$(printf '%s\n' "$status_events" \
+    | jq -r '.type' 2>/dev/null \
+    | sort \
+    | uniq -c \
+    | awk '{printf "%s(%s) ", $2, $1}')"
+else
+  event_summary="(none)"
+fi
+
+cat <<EOF
+host:       $HOST
+run dir:    $REMOTE_DIR
+last event: $last_type
+phase:      $phase
+activity:   $act
+elapsed:    ${elapsed}s
+tool calls: $tool_calls
+tokens:     $tokens
+files:      $files
+subagents:  $subagents_active active
+events:     $event_summary
+EOF

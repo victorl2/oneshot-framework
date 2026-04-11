@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# oneshot-dispatch
+#
+# Ships a prepared dispatch bundle to a remote Oneshot server and starts
+# a sandbox container to run it. The companion to the (future) discuss-agent
+# seal step.
+#
+# Responsibilities:
+#   1. Validate the bundle directory has the expected files
+#   2. Rsync the bundle to $VOLUME_ROOT/runs/$RUN_ID/bundle/ on the server
+#   3. Start a container via `docker run` with:
+#        - volume mount for the run artifacts (status.jsonl, heartbeats.jsonl,
+#          current.json, agent.log)
+#        - volume mount for the bundle (read-only)
+#        - CPU / memory / GPU limits from CLI or profile
+#        - env vars for the run id and model
+#   4. Emit `dispatched` (local) and `received` (server) events
+#   5. Print the run_id and a `oneshot-status` command to follow along
+#
+# This script is shell-only by design — no premature CJS/Python layer.
+# When the framework grows a proper orchestrator, this logic gets wrapped.
+#
+# Required on the operator's machine: bash 4+, ssh, rsync, jq
+# Required on the server: docker, bash, git
+#
+# See DESIGN.md §3 (Dispatcher) and §"Storage Topology".
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: oneshot-dispatch [options] <bundle_dir>
+
+Required:
+  --host <hostname>          SSH target (e.g. user@host, or hostname)
+
+Optional:
+  --run-id <id>              Run identifier (default: r-YYYYMMDD-HHMMSS)
+  --volume-root <path>       Server-side volume root (default: /var/lib/oneshot)
+  --image <name:tag>         Sandbox image (default: oneshot-sandbox:latest)
+  --cpu <n>                  CPU limit (default: 4)
+  --memory <size>            Memory limit, Docker format (default: 8g)
+  --gpu                      Request GPU passthrough
+  --local-run-dir <path>     Local run dir; if set, dispatched event is
+                             written to <path>/status.jsonl
+  --dry-run                  Print what would happen, don't execute
+  -h, --help                 Show this help
+
+The bundle_dir must contain at least:
+  requirements.md
+  project.md
+
+See DESIGN.md §3 (Dispatcher) for the full bundle contract.
+EOF
+}
+
+HOST=""
+RUN_ID=""
+VOLUME_ROOT="/var/lib/oneshot"
+IMAGE="oneshot-sandbox:latest"
+CPU="4"
+MEMORY="8g"
+GPU_FLAGS=""
+LOCAL_RUN_DIR=""
+DRY_RUN=0
+BUNDLE_DIR=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --host)          HOST="$2"; shift 2 ;;
+    --run-id)        RUN_ID="$2"; shift 2 ;;
+    --volume-root)   VOLUME_ROOT="$2"; shift 2 ;;
+    --image)         IMAGE="$2"; shift 2 ;;
+    --cpu)           CPU="$2"; shift 2 ;;
+    --memory)        MEMORY="$2"; shift 2 ;;
+    --gpu)           GPU_FLAGS="--gpus all"; shift ;;
+    --local-run-dir) LOCAL_RUN_DIR="$2"; shift 2 ;;
+    --dry-run)       DRY_RUN=1; shift ;;
+    -h|--help)       usage; exit 0 ;;
+    --)              shift; BUNDLE_DIR="$1"; shift ;;
+    -*)
+      echo "error: unknown flag: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+    *)
+      if [[ -z "$BUNDLE_DIR" ]]; then
+        BUNDLE_DIR="$1"
+      else
+        echo "error: unexpected positional arg: $1" >&2
+        exit 2
+      fi
+      shift
+      ;;
+  esac
+done
+
+require() {
+  if [[ -z "${!1}" ]]; then
+    echo "error: $1 is required" >&2
+    usage >&2
+    exit 2
+  fi
+}
+
+require HOST
+if [[ -z "$BUNDLE_DIR" ]]; then
+  echo "error: bundle_dir argument is required" >&2
+  usage >&2
+  exit 2
+fi
+
+if [[ ! -d "$BUNDLE_DIR" ]]; then
+  echo "error: bundle_dir not found: $BUNDLE_DIR" >&2
+  exit 1
+fi
+
+# Validate bundle structure.
+missing=()
+for f in requirements.md project.md; do
+  if [[ ! -f "$BUNDLE_DIR/$f" ]]; then
+    missing+=("$f")
+  fi
+done
+if [[ ${#missing[@]} -gt 0 ]]; then
+  echo "error: bundle is missing required files:" >&2
+  printf '  %s\n' "${missing[@]}" >&2
+  exit 1
+fi
+
+# Derive run id if not provided.
+if [[ -z "$RUN_ID" ]]; then
+  RUN_ID="r-$(date -u +%Y%m%d-%H%M%S)"
+fi
+
+REMOTE_RUN_DIR="$VOLUME_ROOT/runs/$RUN_ID"
+REMOTE_BUNDLE_DIR="$REMOTE_RUN_DIR/bundle"
+
+log() { printf '[dispatch] %s\n' "$*"; }
+
+iso_now() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+log "run_id:      $RUN_ID"
+log "host:        $HOST"
+log "image:       $IMAGE"
+log "cpu/memory:  $CPU / $MEMORY"
+[[ -n "$GPU_FLAGS" ]] && log "gpu:         yes"
+log "bundle:      $BUNDLE_DIR"
+log "remote dir:  $REMOTE_RUN_DIR"
+
+run_or_echo() {
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "  DRY: $*"
+  else
+    eval "$@"
+  fi
+}
+
+# 1. Prepare remote run directory.
+log "preparing remote run directory"
+run_or_echo "ssh '$HOST' 'mkdir -p $REMOTE_RUN_DIR $REMOTE_BUNDLE_DIR'"
+
+# 2. Ship bundle via rsync (delete-extraneous so the remote is exactly the local).
+log "shipping bundle via rsync"
+run_or_echo "rsync -az --delete '$BUNDLE_DIR/' '$HOST:$REMOTE_BUNDLE_DIR/'"
+
+# 3. Emit `dispatched` event locally (if a local run dir was provided).
+if [[ -n "$LOCAL_RUN_DIR" && $DRY_RUN -eq 0 ]]; then
+  mkdir -p "$LOCAL_RUN_DIR"
+  local_status="$LOCAL_RUN_DIR/status.jsonl"
+  gpu_bool="false"
+  [[ -n "$GPU_FLAGS" ]] && gpu_bool="true"
+  dispatched_event=$(jq -nc \
+    --arg ts "$(iso_now)" \
+    --arg run_id "$RUN_ID" \
+    --arg host "$HOST" \
+    --arg cpu "$CPU" \
+    --arg memory "$MEMORY" \
+    --argjson gpu "$gpu_bool" \
+    '{ts:$ts,type:"dispatched",run_id:$run_id,host:$host,container_spec:{cpu:$cpu,memory:$memory,gpu:$gpu}}')
+  printf '%s\n' "$dispatched_event" >> "$local_status"
+  log "emitted dispatched → $local_status"
+fi
+
+# 4. Start the container on the server.
+log "starting sandbox container on $HOST"
+docker_cmd="docker run -d \
+  --name oneshot-$RUN_ID \
+  --cpus=$CPU \
+  --memory=$MEMORY \
+  $GPU_FLAGS \
+  -v $REMOTE_RUN_DIR:/workspace/run \
+  -v $REMOTE_BUNDLE_DIR:/workspace/repo:ro \
+  -e ONESHOT_RUN_ID=$RUN_ID \
+  -e ONESHOT_MODEL=${ONESHOT_MODEL:-claude-opus-4-6} \
+  $IMAGE"
+
+if [[ $DRY_RUN -eq 1 ]]; then
+  echo "  DRY: ssh '$HOST' '$docker_cmd'"
+  container_id="dry-run-fake-id"
+else
+  container_id="$(ssh "$HOST" "$docker_cmd")"
+  log "container id: $container_id"
+
+  # 5. Emit `received` event on the server's status.jsonl.
+  received_event=$(jq -nc --arg ts "$(iso_now)" --arg cid "$container_id" \
+    '{ts:$ts,type:"received",container_id:$cid}')
+  ssh "$HOST" "printf '%s\n' '$received_event' >> $REMOTE_RUN_DIR/status.jsonl"
+fi
+
+log "dispatched $RUN_ID"
+log ""
+log "follow progress with:"
+log "  oneshot-status '$HOST' '$REMOTE_RUN_DIR'"
+log ""
+log "stream logs with:"
+log "  ssh '$HOST' tail -f '$REMOTE_RUN_DIR/agent.log'"
