@@ -36,10 +36,11 @@ Required:
 
 Optional:
   --run-id <id>              Run identifier (default: r-YYYYMMDD-HHMMSS)
-  --volume-root <path>       Server-side volume root (default: /var/lib/oneshot)
+  --volume-root <path>       Server-side volume root (default: ~/oneshot-data)
   --image <name:tag>         Sandbox image (default: oneshot-sandbox:latest)
+  --runtime <cmd>            Container runtime on server (default: podman)
   --cpu <n>                  CPU limit (default: 4)
-  --memory <size>            Memory limit, Docker format (default: 8g)
+  --memory <size>            Memory limit (default: 8g)
   --gpu                      Request GPU passthrough
   --local-run-dir <path>     Local run dir; if set, dispatched event is
                              written to <path>/status.jsonl
@@ -56,8 +57,9 @@ EOF
 
 HOST=""
 RUN_ID=""
-VOLUME_ROOT="/var/lib/oneshot"
+VOLUME_ROOT="~/oneshot-data"
 IMAGE="oneshot-sandbox:latest"
+RUNTIME="podman"
 CPU="4"
 MEMORY="8g"
 GPU_FLAGS=""
@@ -71,6 +73,7 @@ while [[ $# -gt 0 ]]; do
     --run-id)        RUN_ID="$2"; shift 2 ;;
     --volume-root)   VOLUME_ROOT="$2"; shift 2 ;;
     --image)         IMAGE="$2"; shift 2 ;;
+    --runtime)       RUNTIME="$2"; shift 2 ;;
     --cpu)           CPU="$2"; shift 2 ;;
     --memory)        MEMORY="$2"; shift 2 ;;
     --gpu)           GPU_FLAGS="--gpus all"; shift ;;
@@ -133,36 +136,53 @@ if [[ -z "$RUN_ID" ]]; then
   RUN_ID="r-$(date -u +%Y%m%d-%H%M%S)"
 fi
 
-REMOTE_RUN_DIR="$VOLUME_ROOT/runs/$RUN_ID"
-REMOTE_BUNDLE_DIR="$REMOTE_RUN_DIR/bundle"
-
 log() { printf '[dispatch] %s\n' "$*"; }
-
 iso_now() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+# Resolve VOLUME_ROOT to an absolute path on the remote (expands ~ on the server).
+if [[ $DRY_RUN -eq 0 ]]; then
+  VOLUME_ROOT_ABS="$(ssh "$HOST" "echo $VOLUME_ROOT")"
+else
+  VOLUME_ROOT_ABS="$VOLUME_ROOT"
+fi
+
+REMOTE_RUN_DIR="$VOLUME_ROOT_ABS/runs/$RUN_ID"
+REMOTE_BUNDLE_DIR="$REMOTE_RUN_DIR/bundle"
 
 log "run_id:      $RUN_ID"
 log "host:        $HOST"
+log "runtime:     $RUNTIME"
 log "image:       $IMAGE"
 log "cpu/memory:  $CPU / $MEMORY"
 [[ -n "$GPU_FLAGS" ]] && log "gpu:         yes"
 log "bundle:      $BUNDLE_DIR"
 log "remote dir:  $REMOTE_RUN_DIR"
 
-run_or_echo() {
-  if [[ $DRY_RUN -eq 1 ]]; then
-    echo "  DRY: $*"
-  else
-    eval "$@"
-  fi
-}
+# Build resource limit flags. Rootless Podman on cgroups v2 may not have cpu/memory
+# controllers delegated — in that case, skip limits and log a note.
+RESOURCE_FLAGS=""
+if [[ "$CPU" != "0" && "$CPU" != "none" ]]; then
+  RESOURCE_FLAGS="--cpus=$CPU"
+fi
+if [[ "$MEMORY" != "0" && "$MEMORY" != "none" ]]; then
+  RESOURCE_FLAGS="$RESOURCE_FLAGS --memory=$MEMORY"
+fi
 
 # 1. Prepare remote run directory.
 log "preparing remote run directory"
-run_or_echo "ssh '$HOST' 'mkdir -p $REMOTE_RUN_DIR $REMOTE_BUNDLE_DIR'"
+if [[ $DRY_RUN -eq 1 ]]; then
+  echo "  DRY: ssh $HOST mkdir -p $REMOTE_RUN_DIR/bundle"
+else
+  ssh "$HOST" "mkdir -p '$REMOTE_RUN_DIR' '$REMOTE_BUNDLE_DIR'"
+fi
 
-# 2. Ship bundle via rsync (delete-extraneous so the remote is exactly the local).
+# 2. Ship bundle via rsync.
 log "shipping bundle via rsync"
-run_or_echo "rsync -az --delete '$BUNDLE_DIR/' '$HOST:$REMOTE_BUNDLE_DIR/'"
+if [[ $DRY_RUN -eq 1 ]]; then
+  echo "  DRY: rsync $BUNDLE_DIR/ → $HOST:$REMOTE_BUNDLE_DIR/"
+else
+  rsync -az --delete "$BUNDLE_DIR/" "$HOST:$REMOTE_BUNDLE_DIR/"
+fi
 
 # 3. Emit `dispatched` event locally (if a local run dir was provided).
 if [[ -n "$LOCAL_RUN_DIR" && $DRY_RUN -eq 0 ]]; then
@@ -184,22 +204,25 @@ fi
 
 # 4. Start the container on the server.
 log "starting sandbox container on $HOST"
-docker_cmd="docker run -d \
+
+# Podman SELinux note: :Z relabels the volume for container access (needed on
+# SELinux-enforcing hosts like Rocky/RHEL). Harmless on non-SELinux systems.
+container_cmd="$RUNTIME run -d \
   --name oneshot-$RUN_ID \
-  --cpus=$CPU \
-  --memory=$MEMORY \
+  $RESOURCE_FLAGS \
   $GPU_FLAGS \
-  -v $REMOTE_RUN_DIR:/workspace/run \
-  -v $REMOTE_BUNDLE_DIR:/workspace/repo:ro \
+  -v $REMOTE_RUN_DIR:/workspace/run:Z \
+  -v $REMOTE_BUNDLE_DIR:/workspace/repo:ro,Z \
   -e ONESHOT_RUN_ID=$RUN_ID \
   -e ONESHOT_MODEL=${ONESHOT_MODEL:-claude-opus-4-6} \
+  -e ONESHOT_HEARTBEAT_INTERVAL_S=5 \
   $IMAGE"
 
 if [[ $DRY_RUN -eq 1 ]]; then
-  echo "  DRY: ssh '$HOST' '$docker_cmd'"
+  echo "  DRY: ssh '$HOST' '$container_cmd'"
   container_id="dry-run-fake-id"
 else
-  container_id="$(ssh "$HOST" "$docker_cmd")"
+  container_id="$(ssh "$HOST" "$container_cmd")"
   log "container id: $container_id"
 
   # 5. Emit `received` event on the server's status.jsonl.
