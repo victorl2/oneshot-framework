@@ -207,15 +207,28 @@ log "starting sandbox container on $HOST"
 
 # Podman SELinux note: :Z relabels the volume for container access (needed on
 # SELinux-enforcing hosts like Rocky/RHEL). Harmless on non-SELinux systems.
+# Build env var flags. ANTHROPIC_API_KEY enables real Claude Code mode;
+# without it the container falls back to the demo agent.
+ENV_FLAGS="-e ONESHOT_RUN_ID=$RUN_ID"
+ENV_FLAGS="$ENV_FLAGS -e ONESHOT_MODEL=${ONESHOT_MODEL:-claude-opus-4-6}"
+ENV_FLAGS="$ENV_FLAGS -e ONESHOT_HEARTBEAT_INTERVAL_S=${ONESHOT_HEARTBEAT_INTERVAL_S:-30}"
+if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+  ENV_FLAGS="$ENV_FLAGS -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY"
+  log "api key:     present (real Claude Code mode)"
+else
+  log "api key:     absent (demo mode)"
+fi
+if [[ -n "${ONESHOT_BUDGET_USD:-}" ]]; then
+  ENV_FLAGS="$ENV_FLAGS -e ONESHOT_BUDGET_USD=$ONESHOT_BUDGET_USD"
+fi
+
 container_cmd="$RUNTIME run -d \
   --name oneshot-$RUN_ID \
   $RESOURCE_FLAGS \
   $GPU_FLAGS \
   -v $REMOTE_RUN_DIR:/workspace/run:Z \
   -v $REMOTE_BUNDLE_DIR:/workspace/repo:ro,Z \
-  -e ONESHOT_RUN_ID=$RUN_ID \
-  -e ONESHOT_MODEL=${ONESHOT_MODEL:-claude-opus-4-6} \
-  -e ONESHOT_HEARTBEAT_INTERVAL_S=5 \
+  $ENV_FLAGS \
   $IMAGE"
 
 if [[ $DRY_RUN -eq 1 ]]; then

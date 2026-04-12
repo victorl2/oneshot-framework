@@ -91,11 +91,44 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Run the agent. If a command was passed, exec it; otherwise run the demo agent
-# for end-to-end pipeline testing.
+# Run the agent. Priority:
+#   1. Explicit command passed as arguments → exec that
+#   2. ANTHROPIC_API_KEY set + bundle present → run Claude Code against the bundle
+#   3. Otherwise → demo-agent simulation
 if [[ $# -gt 0 ]]; then
   "$@" 2>&1 | tee -a "$AGENT_LOG"
+elif [[ -n "${ANTHROPIC_API_KEY:-}" ]] && [[ -f "$RUN_DIR/bundle/requirements.md" ]]; then
+  echo "[oneshot] ANTHROPIC_API_KEY set + bundle found — running Claude Code agent" | tee -a "$AGENT_LOG"
+
+  SYSTEM_PROMPT="/usr/local/share/oneshot/system-prompt.md"
+  SETTINGS="/usr/local/share/oneshot/settings.json"
+  BUDGET="${ONESHOT_BUDGET_USD:-10}"
+  RUN_ID="${ONESHOT_RUN_ID:-unknown}"
+
+  # Build the prompt from the requirements file
+  PROMPT="$(cat "$RUN_DIR/bundle/requirements.md")"
+
+  # Configure git for the agent (needed for commits)
+  git config --global user.name "oneshot-agent"
+  git config --global user.email "oneshot@localhost"
+  git config --global init.defaultBranch main
+
+  # Run Claude Code in headless mode
+  #   --print            → non-interactive, exits when done
+  #   --dangerously-skip-permissions → auto-approve all tool calls (sandbox is isolated)
+  #   --system-prompt-file → our implementation agent prompt
+  #   --settings         → our hooks for event emission
+  #   --max-budget-usd   → cost cap
+  claude \
+    --print \
+    --dangerously-skip-permissions \
+    --system-prompt-file "$SYSTEM_PROMPT" \
+    --settings "$SETTINGS" \
+    --add-dir "$RUN_DIR/bundle" \
+    --max-budget-usd "$BUDGET" \
+    "$PROMPT" \
+    2>&1 | tee -a "$AGENT_LOG"
 else
-  echo "[oneshot] no command argument — running demo-agent simulation" | tee -a "$AGENT_LOG"
+  echo "[oneshot] no API key or no bundle — running demo-agent simulation" | tee -a "$AGENT_LOG"
   /usr/local/lib/oneshot/demo-agent.sh 2>&1 | tee -a "$AGENT_LOG"
 fi
