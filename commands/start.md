@@ -13,45 +13,110 @@ allowed-tools:
 <context>
 **Flags:**
 - `--profile <name>` — Use a named sandbox profile from `config.yml` (`small` / `medium` / `large` / `xlarge` / `gpu`).
-- `--cpu <n>` — Override CPU allocation (fractional cores allowed).
-- `--ram <size>` — Override memory limit (e.g. `8g`, `16g`).
+- `--cpu <n>` — Override CPU allocation (fractional cores allowed). Use `none` to skip limits.
+- `--ram <size>` — Override memory limit (e.g. `8g`, `16g`). Use `none` to skip limits.
 - `--gpu` — Request GPU passthrough.
 - `--force` — Dispatch even if the requirements score is below the soft-gate threshold.
+
+**Server configuration:** reads `server.host` from `~/.claude/oneshot/{project}/config.yml`. If not configured, prompts the operator.
 </context>
 
 <objective>
-Start a new Oneshot run: enter the discuss loop, score requirements in real time, and dispatch to a sandbox container on the server once the gate is cleared.
+Start a new Oneshot run. In this v0 implementation, the full discuss + scorer loop is deferred — instead, the command gathers requirements through a simplified conversational flow, packages a bundle, dispatches it to the remote server, and polls until the run completes.
 
-**Flow:**
-1. Spawn the Discuss Agent (see `agents/oneshot-discuss.md`).
-2. Silent Requirements Scorer runs alongside (see `agents/oneshot-scorer.md`).
-3. Discuss-agent gets live access to a remote Discussion Sandbox for exploration (see DESIGN §2).
-4. When the operator seals requirements (or hits `--force`), package the dispatch bundle.
-5. Ship the bundle to the server via the Dispatcher.
-6. Sandbox runtime spins up a container, the Implementation Agent runs.
-7. Progress tracker streams events back to the orchestrator.
-8. CI Gate enforces that "done" requires the PR to be open *and* required CI green.
-9. Report the PR URL, run ID, and final status.
+**What works now:**
+- Project resolution (git remote → slug)
+- Requirements gathering via direct conversation (simplified, no scorer yet)
+- Bundle creation (`requirements.md`, `project.md` snapshot, git ref)
+- Dispatch via `bin/oneshot-dispatch` (SSH + rsync + Podman)
+- Status polling via `bin/oneshot-status`
+- Run directory creation at `~/.claude/oneshot/{project}/runs/{timestamp}/`
+
+**Future (not yet wired):**
+- Silent Requirements Scorer running in parallel
+- Discussion Sandbox for remote exploration during discuss
+- Exploration artifact capture into the bundle
+- Score display and soft-gate threshold
 </objective>
 
 <execution_context>
 @~/.claude/oneshot/references/scoring-model.md
-@~/.claude/oneshot/references/discussion-sandbox.md
-@~/.claude/oneshot/references/progress-tracker.md
-@~/.claude/oneshot/references/ci-gate.md
 @~/.claude/oneshot/templates/requirements.md
+@~/.claude/oneshot/templates/config.yml
 </execution_context>
 
 <process>
-See DESIGN.md §"Usage", §2 (Discuss Agent), §3 (Dispatcher), §5 (Progress Tracker), §6 (CI Gate).
+Execute the following steps. This is a WORKING command, not a stub.
 
-**NOT YET IMPLEMENTED** — this stub documents the intended behavior.
+## Step 1: Resolve project identity
 
-1. Resolve sandbox config: CLI flags > profile > defaults from `config.yml`.
-2. Resolve project identity from `git remote get-url origin` or the `.oneshot-project` marker.
-3. Create a new run directory `~/.claude/oneshot/{project}/runs/{timestamp}/`.
-4. Spawn the discuss-agent with the scorer running in parallel.
-5. On seal: package bundle (`requirements.md`, `project.md` snapshot, `exploration/`, git ref, sandbox config).
-6. Dispatch via SSH to the configured server host.
-7. Watch progress via the event stream; return once the run terminates (`completed` or `failed`).
+Derive the project slug for state directory lookup:
+1. Try `git remote get-url origin` in the current repo — normalize it (strip `.git`, scheme, slashes → slug).
+2. Fall back to the basename of the current working directory.
+3. Check for `.oneshot-project` file at repo root for a manual override.
+
+Set `PROJECT_DIR=~/.claude/oneshot/{slug}/`.
+
+## Step 2: Load or create project config
+
+If `$PROJECT_DIR/config.yml` exists, read it for `server.host`, `server.volume_root`, sandbox defaults, and scoring thresholds.
+
+If `$PROJECT_DIR` doesn't exist, tell the operator to run `/oneshot:new-project` first. Do NOT silently create it — the project needs to be initialized properly.
+
+## Step 3: Gather requirements (simplified v0)
+
+For v0, skip the full discuss + scorer loop. Instead:
+1. Read the task description from the user's slash command arguments.
+2. Ask the operator **focused clarifying questions** about:
+   - Goal (what should the change accomplish)
+   - Scope (what's in, what's explicitly out)
+   - Acceptance criteria (how do we know it's done)
+   - Error semantics (what happens on failure — mandatory per DESIGN)
+3. Write `requirements.md` using the template from `@~/.claude/oneshot/templates/requirements.md`.
+
+**Important:** even without the scorer, ask about error semantics explicitly. Vague error contracts are the #1 predictor of one-shot failure per DESIGN calibration analysis.
+
+## Step 4: Package the dispatch bundle
+
+Create a timestamped run directory and bundle:
+
+```bash
+RUN_ID="r-$(date -u +%Y%m%d-%H%M%S)"
+RUN_DIR="$PROJECT_DIR/runs/$RUN_ID"
+BUNDLE_DIR="$RUN_DIR/bundle"
+mkdir -p "$BUNDLE_DIR"
+```
+
+Write into the bundle:
+- `requirements.md` — the sealed requirements from step 3
+- `project.md` — copy from `$PROJECT_DIR/project.md`
+- Git ref: `git rev-parse HEAD` (the base commit the agent should branch from)
+
+## Step 5: Dispatch
+
+Read server config from `config.yml`:
+- `server.host` (required — SSH target)
+- `server.volume_root` (default: `~/oneshot-data`)
+
+Call the dispatcher:
+
+```bash
+~/code/oneshot-framework/bin/oneshot-dispatch \
+  --host "$SERVER_HOST" \
+  --volume-root "$VOLUME_ROOT" \
+  --run-id "$RUN_ID" \
+  --cpu "$CPU" --memory "$MEMORY" \
+  --local-run-dir "$RUN_DIR" \
+  "$BUNDLE_DIR"
+```
+
+If dispatch succeeds, report the run_id and how to follow along:
+- `/oneshot status $RUN_ID`
+- `/oneshot watch $RUN_ID`
+
+## Step 6: Poll status (optional)
+
+Ask the operator if they want to watch the run. If yes, poll `oneshot-status` every 15 seconds until the run reaches a terminal state (`completed` or `failed`).
+
+Report the final outcome: PR URL (if completed), or failure reason.
 </process>
