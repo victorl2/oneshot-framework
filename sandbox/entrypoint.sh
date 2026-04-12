@@ -97,8 +97,8 @@ trap cleanup EXIT
 #   3. Otherwise → demo-agent simulation
 if [[ $# -gt 0 ]]; then
   "$@" 2>&1 | tee -a "$AGENT_LOG"
-elif [[ -n "${ANTHROPIC_API_KEY:-}" ]] && [[ -f "$RUN_DIR/bundle/requirements.md" ]]; then
-  echo "[oneshot] ANTHROPIC_API_KEY set + bundle found — running Claude Code agent" | tee -a "$AGENT_LOG"
+elif [[ -f "$RUN_DIR/bundle/requirements.md" ]]; then
+  echo "[oneshot] bundle found — running Claude Code agent with subscription auth" | tee -a "$AGENT_LOG"
 
   SYSTEM_PROMPT="/usr/local/share/oneshot/system-prompt.md"
   SETTINGS="/usr/local/share/oneshot/settings.json"
@@ -113,12 +113,19 @@ elif [[ -n "${ANTHROPIC_API_KEY:-}" ]] && [[ -f "$RUN_DIR/bundle/requirements.md
   git config --global user.email "oneshot@localhost"
   git config --global init.defaultBranch main
 
+  # Auth: the container expects the server's ~/.claude/ to be mounted at
+  # /root/.claude/ (or $HOME/.claude/) — this provides the OAuth session
+  # from the user's Claude Code subscription login. No API key needed.
+  #
+  # If ANTHROPIC_API_KEY is also set, Claude Code will prefer it — either works.
+
   # Run Claude Code in headless mode
-  #   --print            → non-interactive, exits when done
+  #   --print                        → non-interactive, exits when done
   #   --dangerously-skip-permissions → auto-approve all tool calls (sandbox is isolated)
-  #   --system-prompt-file → our implementation agent prompt
-  #   --settings         → our hooks for event emission
-  #   --max-budget-usd   → cost cap
+  #   --system-prompt-file           → our implementation agent prompt
+  #   --settings                     → our hooks for event emission
+  #   --add-dir                      → make bundle files accessible
+  #   --max-budget-usd               → cost cap per run
   claude \
     --print \
     --dangerously-skip-permissions \

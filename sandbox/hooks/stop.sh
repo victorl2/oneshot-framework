@@ -1,19 +1,15 @@
 #!/usr/bin/env bash
 # Claude Code Stop hook for Oneshot sandbox.
 #
-# Fires when the Claude Code session ends. Responsibility: emit the
-# terminal event (`completed` or `failed`) if the agent itself didn't
-# already do so.
+# Fires when the Claude Code session ends. The hook does NOT emit terminal
+# events (completed/failed) on its own — the entrypoint's EXIT trap is the
+# authoritative source for those, because it sees the real exit code of the
+# `claude` command. A clean exit from Claude Code means success; a non-zero
+# exit means failure. The Stop hook can't observe either, so it shouldn't
+# guess.
 #
-# Note: the CI Gate requires `completed` to be preceded by `ci_passed`.
-# This hook must not emit `completed` unilaterally — the agent is expected
-# to emit its own terminal events after driving CI green. If the session
-# stops without those events, this hook emits `failed` with reason
-# `stopped_without_terminal_event`.
-#
-# Status: STUB. The entrypoint's cleanup trap currently handles fallback
-# terminal events. This hook becomes authoritative once real Claude Code
-# is wired in.
+# Reserved for future per-session bookkeeping that doesn't involve emitting
+# terminal events (e.g. counting messages, logging cost, flushing state).
 
 set -euo pipefail
 
@@ -23,14 +19,6 @@ source /usr/local/lib/oneshot/counters.sh
 # Drain stdin — Claude Code sends a JSON payload we don't currently use.
 [[ -t 0 ]] || cat >/dev/null
 
-# If a terminal event is already present, do nothing.
-if grep -q '"type":"completed"' "$STATUS_FILE" 2>/dev/null \
-|| grep -q '"type":"failed"' "$STATUS_FILE" 2>/dev/null; then
-  exit 0
-fi
-
-# Session ended without the agent emitting a terminal event.
-# Treat this as a failure — the agent's contract is to drive the run to
-# a known terminal state before stopping.
-last_phase=$(jq -r '.phase // "unknown"' "$COUNTERS_FILE" 2>/dev/null || echo "unknown")
-oneshot_failed "stopped_without_terminal_event" "$last_phase"
+# Intentionally a no-op for now. The entrypoint's EXIT trap handles terminal
+# events based on the actual exit code.
+exit 0

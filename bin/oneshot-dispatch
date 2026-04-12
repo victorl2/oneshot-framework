@@ -207,27 +207,49 @@ log "starting sandbox container on $HOST"
 
 # Podman SELinux note: :Z relabels the volume for container access (needed on
 # SELinux-enforcing hosts like Rocky/RHEL). Harmless on non-SELinux systems.
-# Build env var flags. ANTHROPIC_API_KEY enables real Claude Code mode;
-# without it the container falls back to the demo agent.
+# Build env var flags.
 ENV_FLAGS="-e ONESHOT_RUN_ID=$RUN_ID"
 ENV_FLAGS="$ENV_FLAGS -e ONESHOT_MODEL=${ONESHOT_MODEL:-claude-opus-4-6}"
 ENV_FLAGS="$ENV_FLAGS -e ONESHOT_HEARTBEAT_INTERVAL_S=${ONESHOT_HEARTBEAT_INTERVAL_S:-30}"
 if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
   ENV_FLAGS="$ENV_FLAGS -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY"
-  log "api key:     present (real Claude Code mode)"
-else
-  log "api key:     absent (demo mode)"
 fi
 if [[ -n "${ONESHOT_BUDGET_USD:-}" ]]; then
   ENV_FLAGS="$ENV_FLAGS -e ONESHOT_BUDGET_USD=$ONESHOT_BUDGET_USD"
 fi
 
+# Auth: mount the server user's ~/.claude/ into the container so the agent
+# inherits the Claude Code subscription login. This avoids needing a separate
+# API key — the container uses the same OAuth session as `claude` on the server.
+# Must be read-write because Claude Code writes session state, cache, and
+# telemetry to ~/.claude/. The container runs as the same UID as the host
+# user (via --userns=keep-id) so this is the user's own directory.
+REMOTE_HOME="$(ssh "$HOST" 'echo $HOME')"
+AUTH_MOUNT="-v ${REMOTE_HOME}/.claude:/home/oneshot/.claude:Z"
+log "auth mount:  ${REMOTE_HOME}/.claude → /home/oneshot/.claude (subscription, rw)"
+
+# User namespace mapping. Claude Code refuses --dangerously-skip-permissions
+# as root, so the container runs as a non-root 'oneshot' user (UID 1000).
+# For Podman: --userns=keep-id maps container UID 1000 to the host user's UID
+# directly, so mounted volumes have transparent permissions. For Docker:
+# --user 1000:1000 achieves a similar effect when host UID is 1000.
+if [[ "$RUNTIME" == "podman" ]]; then
+  USERNS_FLAG="--userns=keep-id"
+else
+  USERNS_FLAG="--user 1000:1000"
+fi
+
+# Bundle mount at /workspace/repo is READ-WRITE so the agent can create files,
+# run git, and make commits. The bundle directory on the server becomes the
+# agent's working copy for this run and persists after the container exits.
 container_cmd="$RUNTIME run -d \
   --name oneshot-$RUN_ID \
+  $USERNS_FLAG \
   $RESOURCE_FLAGS \
   $GPU_FLAGS \
+  $AUTH_MOUNT \
   -v $REMOTE_RUN_DIR:/workspace/run:Z \
-  -v $REMOTE_BUNDLE_DIR:/workspace/repo:ro,Z \
+  -v $REMOTE_BUNDLE_DIR:/workspace/repo:Z \
   $ENV_FLAGS \
   $IMAGE"
 

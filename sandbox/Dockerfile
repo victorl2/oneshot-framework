@@ -59,19 +59,29 @@ RUN chmod +x /usr/local/bin/oneshot-entrypoint \
              /usr/local/share/oneshot/hooks/*.sh \
              /usr/local/lib/oneshot/*.sh
 
+# Non-root user for running the agent. Claude Code refuses
+# --dangerously-skip-permissions as root for safety, so we create a regular
+# user and run everything as them. With Podman --userns=keep-id, container
+# UID 1000 maps to the host user's UID transparently — mounted volumes work
+# without permission headaches.
+RUN useradd -m -u 1000 -s /bin/bash oneshot
+
 # Volume mount points:
-#   /workspace/run  — server-persistent volume for status.jsonl, heartbeats.jsonl,
-#                     current.json, agent.log, result.json
-#   /workspace/repo — git worktree (dispatched bundle or actual repo clone)
-#   /root/.claude   — skill + MCP snapshot from the dispatch bundle
-RUN mkdir -p /workspace/run /workspace/repo /root/.claude
+#   /workspace/run         — server-persistent volume (status.jsonl, heartbeats.jsonl,
+#                            current.json, agent.log, result.json)
+#   /workspace/repo        — git worktree (dispatched bundle or repo clone)
+#   /home/oneshot/.claude  — Claude Code auth + config mounted from the host user
+RUN mkdir -p /workspace/run /workspace/repo /home/oneshot/.claude \
+    && chown -R oneshot:oneshot /workspace /home/oneshot
 
 ENV ONESHOT_RUN_DIR=/workspace/run \
     ONESHOT_REPO_DIR=/workspace/repo \
-    ONESHOT_CLAUDE_DIR=/root/.claude \
+    ONESHOT_CLAUDE_DIR=/home/oneshot/.claude \
     ONESHOT_HEARTBEAT_INTERVAL_S=30 \
-    ONESHOT_MODEL=unknown
+    ONESHOT_MODEL=unknown \
+    HOME=/home/oneshot
 
+USER oneshot
 WORKDIR /workspace/repo
 
 ENTRYPOINT ["/usr/local/bin/oneshot-entrypoint"]
