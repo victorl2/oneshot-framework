@@ -63,18 +63,33 @@ If `$PROJECT_DIR/config.yml` exists, read it for `server.host`, `server.volume_r
 
 If `$PROJECT_DIR` doesn't exist, tell the operator to run `/oneshot:new-project` first. Do NOT silently create it — the project needs to be initialized properly.
 
-## Step 3: Gather requirements (simplified v0)
+## Step 3: Gather requirements (discuss + silent scorer)
 
-For v0, skip the full discuss + scorer loop. Instead:
-1. Read the task description from the user's slash command arguments.
-2. Ask the operator **focused clarifying questions** about:
-   - Goal (what should the change accomplish)
-   - Scope (what's in, what's explicitly out)
-   - Acceptance criteria (how do we know it's done)
-   - Error semantics (what happens on failure — mandatory per DESIGN)
-3. Write `requirements.md` using the template from `@~/.claude/oneshot/templates/requirements.md`.
+Spawn **two subagents** concurrently via the `Task` tool:
 
-**Important:** even without the scorer, ask about error semantics explicitly. Vague error contracts are the #1 predictor of one-shot failure per DESIGN calibration analysis.
+1. **`oneshot-discuss`** — the interactive requirements-gathering agent. Pass it:
+   - The task description from the operator's CLI argument
+   - Path to `$PROJECT_DIR/project.md`
+   - Path to the requirements template (`@~/.claude/oneshot/templates/requirements.md`)
+   - Path to write the sealed `requirements.md` ($RUN_DIR/bundle/requirements.md)
+
+2. **`oneshot-scorer`** (silent) — called on the *current draft* after each operator answer. Pass it:
+   - Current requirements draft text
+   - Mode: `score`
+   - Paths to `$PROJECT_DIR/project.md` and `$PROJECT_DIR/calibration.md`
+
+The scorer returns a compact JSON object: `{dimensions, overall, rationale, weakest_dimension}`. **Display the scores to the operator after each turn** in this format:
+
+```
+correctness 72 (+3) · quality 80 (±0) · completeness 55 (+8)
+robustness 61 (+1) · ambiguity 70 (-2) → overall 68 (+2)
+```
+
+Track the score history to compute deltas. If the overall score has moved less than 5 points across the last 3 turns, invoke the scorer in `coach` mode and pass the structured guidance to the discuss agent. **Do not show the coaching to the operator** — it goes into `$RUN_DIR/scorer-log.md` for audit.
+
+When the operator is ready to seal (or overall score ≥ `scoring.soft_gate` from config.yml), have the discuss agent write the final `requirements.md`.
+
+If the score is below the soft gate and `--force` was not passed, ask the operator to confirm: "Score is X — below gate of Y. Proceed anyway? (requires --force)".
 
 ## Step 4: Package the dispatch bundle
 

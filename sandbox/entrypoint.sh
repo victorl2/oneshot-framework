@@ -113,19 +113,6 @@ elif [[ -f "$RUN_DIR/bundle/requirements.md" ]]; then
   git config --global user.email "oneshot@localhost"
   git config --global init.defaultBranch main
 
-  # Auth: the container expects the server's ~/.claude/ to be mounted at
-  # /root/.claude/ (or $HOME/.claude/) — this provides the OAuth session
-  # from the user's Claude Code subscription login. No API key needed.
-  #
-  # If ANTHROPIC_API_KEY is also set, Claude Code will prefer it — either works.
-
-  # Run Claude Code in headless mode
-  #   --print                        → non-interactive, exits when done
-  #   --dangerously-skip-permissions → auto-approve all tool calls (sandbox is isolated)
-  #   --system-prompt-file           → our implementation agent prompt
-  #   --settings                     → our hooks for event emission
-  #   --add-dir                      → make bundle files accessible
-  #   --max-budget-usd               → cost cap per run
   claude \
     --print \
     --dangerously-skip-permissions \
@@ -135,7 +122,90 @@ elif [[ -f "$RUN_DIR/bundle/requirements.md" ]]; then
     --max-budget-usd "$BUDGET" \
     "$PROMPT" \
     2>&1 | tee -a "$AGENT_LOG"
+
+  claude_exit=$?
+  echo "[oneshot] claude exited with code $claude_exit" | tee -a "$AGENT_LOG"
+
+  # CI Gate — detach-and-reattach watch window.
+  #
+  # If the agent opened a PR (we can detect this via `gh pr view` in the repo),
+  # watch CI for up to CI_INITIAL_WAIT_S seconds. The three outcomes map
+  # to terminal events:
+  #   - All required checks green within window → emit ci_passed + completed
+  #   - Any required check fails within window  → emit ci_failed + failed
+  #   - Still running at window expiry          → emit ci_pending, exit clean
+  #                                                (orchestrator polls externally)
+  #
+  # This is v0 — no fix-sandbox dispatching yet. See DESIGN.md §6.
+  CI_INITIAL_WAIT_S="${CI_INITIAL_WAIT_S:-120}"
+
+  if [[ $claude_exit -eq 0 ]] && [[ -d /workspace/repo ]] && command -v gh >/dev/null 2>&1; then
+    cd /workspace/repo 2>/dev/null || cd "$RUN_DIR"
+
+    # Check if a PR is associated with the current branch.
+    pr_json="$(gh pr view --json url,state,headRefName,commits 2>/dev/null || echo '')"
+
+    if [[ -n "$pr_json" ]]; then
+      pr_url="$(echo "$pr_json" | jq -r '.url // ""')"
+      pr_branch="$(echo "$pr_json" | jq -r '.headRefName // ""')"
+      pr_commits="$(echo "$pr_json" | jq -r '(.commits // []) | length')"
+
+      if [[ -n "$pr_url" ]]; then
+        echo "[oneshot] PR detected: $pr_url — entering CI Gate watch window (${CI_INITIAL_WAIT_S}s)" | tee -a "$AGENT_LOG"
+
+        # Emit pr_opened if the hook didn't already
+        if ! grep -q '"type":"pr_opened"' "$STATUS_FILE"; then
+          emit_status "{\"ts\":\"$(iso_now)\",\"type\":\"pr_opened\",\"url\":\"$pr_url\",\"branch\":\"$pr_branch\",\"commits\":${pr_commits:-1}}"
+        fi
+
+        # Enumerate required checks (from branch protection).
+        # If none configured, treat as trivially passing.
+        required_checks="$(gh pr checks --required 2>/dev/null || echo '')"
+        if [[ -z "$required_checks" ]]; then
+          echo "[oneshot] no required CI checks configured — treating as passed" | tee -a "$AGENT_LOG"
+          emit_status "{\"ts\":\"$(iso_now)\",\"type\":\"ci_passed\",\"checks_passed\":[]}"
+          emit_status "{\"ts\":\"$(iso_now)\",\"type\":\"completed\",\"result_summary\":\"PR $pr_url opened; no required CI checks\"}"
+        else
+          emit_status "{\"ts\":\"$(iso_now)\",\"type\":\"ci_waiting\",\"pr_url\":\"$pr_url\"}"
+
+          # Poll gh pr checks until terminal or timeout.
+          start=$(date +%s)
+          while true; do
+            now=$(date +%s)
+            elapsed=$(( now - start ))
+            if (( elapsed >= CI_INITIAL_WAIT_S )); then
+              echo "[oneshot] CI still running at watch expiry — detaching (ci_pending)" | tee -a "$AGENT_LOG"
+              emit_status "{\"ts\":\"$(iso_now)\",\"type\":\"ci_pending\",\"elapsed_s\":$elapsed}"
+              break
+            fi
+
+            status="$(gh pr checks --required 2>&1 || true)"
+            # gh pr checks exits 0 if all pass, 8 if pending, non-zero + 8 otherwise.
+            rc=$?
+
+            if [[ $rc -eq 0 ]]; then
+              echo "[oneshot] CI passed — all required checks green" | tee -a "$AGENT_LOG"
+              emit_status "{\"ts\":\"$(iso_now)\",\"type\":\"ci_passed\",\"elapsed_s\":$elapsed}"
+              emit_status "{\"ts\":\"$(iso_now)\",\"type\":\"completed\",\"result_summary\":\"PR $pr_url CI green\"}"
+              break
+            fi
+
+            # Any failing check means ci_failed, even if others are pending.
+            if echo "$status" | grep -qE '(fail|FAIL|error|ERROR)'; then
+              failing="$(echo "$status" | grep -E '(fail|FAIL|error|ERROR)' | awk '{print $1}' | tr '\n' ',' | sed 's/,$//')"
+              echo "[oneshot] CI failed — failing checks: $failing" | tee -a "$AGENT_LOG"
+              emit_status "{\"ts\":\"$(iso_now)\",\"type\":\"ci_failed\",\"failing_checks\":[\"$failing\"],\"elapsed_s\":$elapsed}"
+              emit_status "{\"ts\":\"$(iso_now)\",\"type\":\"failed\",\"reason\":\"ci_failed\",\"last_phase\":\"ci_waiting\"}"
+              break
+            fi
+
+            sleep 10
+          done
+        fi
+      fi
+    fi
+  fi
 else
-  echo "[oneshot] no API key or no bundle — running demo-agent simulation" | tee -a "$AGENT_LOG"
+  echo "[oneshot] no bundle — running demo-agent simulation" | tee -a "$AGENT_LOG"
   /usr/local/lib/oneshot/demo-agent.sh 2>&1 | tee -a "$AGENT_LOG"
 fi

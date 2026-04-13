@@ -39,6 +39,12 @@ Optional:
   --volume-root <path>       Server-side volume root (default: ~/oneshot-data)
   --image <name:tag>         Sandbox image (default: oneshot-sandbox:latest)
   --runtime <cmd>            Container runtime on server (default: podman)
+  --repo-path <path>         Local path to the target git repo. If set,
+                             rsyncs the working copy to the server and
+                             mounts it at /workspace/repo (writable) as
+                             the agent's working directory. If unset,
+                             the bundle directory is used as-is (only
+                             useful for smoke tests).
   --cpu <n>                  CPU limit (default: 4)
   --memory <size>            Memory limit (default: 8g)
   --gpu                      Request GPU passthrough
@@ -60,6 +66,7 @@ RUN_ID=""
 VOLUME_ROOT="~/oneshot-data"
 IMAGE="oneshot-sandbox:latest"
 RUNTIME="podman"
+REPO_PATH=""
 CPU="4"
 MEMORY="8g"
 GPU_FLAGS=""
@@ -74,6 +81,7 @@ while [[ $# -gt 0 ]]; do
     --volume-root)   VOLUME_ROOT="$2"; shift 2 ;;
     --image)         IMAGE="$2"; shift 2 ;;
     --runtime)       RUNTIME="$2"; shift 2 ;;
+    --repo-path)     REPO_PATH="$2"; shift 2 ;;
     --cpu)           CPU="$2"; shift 2 ;;
     --memory)        MEMORY="$2"; shift 2 ;;
     --gpu)           GPU_FLAGS="--gpus all"; shift ;;
@@ -148,6 +156,7 @@ fi
 
 REMOTE_RUN_DIR="$VOLUME_ROOT_ABS/runs/$RUN_ID"
 REMOTE_BUNDLE_DIR="$REMOTE_RUN_DIR/bundle"
+REMOTE_REPO_DIR="$REMOTE_RUN_DIR/repo"
 
 log "run_id:      $RUN_ID"
 log "host:        $HOST"
@@ -156,6 +165,7 @@ log "image:       $IMAGE"
 log "cpu/memory:  $CPU / $MEMORY"
 [[ -n "$GPU_FLAGS" ]] && log "gpu:         yes"
 log "bundle:      $BUNDLE_DIR"
+[[ -n "$REPO_PATH" ]] && log "repo:        $REPO_PATH"
 log "remote dir:  $REMOTE_RUN_DIR"
 
 # Build resource limit flags. Rootless Podman on cgroups v2 may not have cpu/memory
@@ -171,9 +181,9 @@ fi
 # 1. Prepare remote run directory.
 log "preparing remote run directory"
 if [[ $DRY_RUN -eq 1 ]]; then
-  echo "  DRY: ssh $HOST mkdir -p $REMOTE_RUN_DIR/bundle"
+  echo "  DRY: ssh $HOST mkdir -p $REMOTE_RUN_DIR/bundle $REMOTE_RUN_DIR/repo"
 else
-  ssh "$HOST" "mkdir -p '$REMOTE_RUN_DIR' '$REMOTE_BUNDLE_DIR'"
+  ssh "$HOST" "mkdir -p '$REMOTE_RUN_DIR' '$REMOTE_BUNDLE_DIR' '$REMOTE_REPO_DIR'"
 fi
 
 # 2. Ship bundle via rsync.
@@ -182,6 +192,29 @@ if [[ $DRY_RUN -eq 1 ]]; then
   echo "  DRY: rsync $BUNDLE_DIR/ → $HOST:$REMOTE_BUNDLE_DIR/"
 else
   rsync -az --delete "$BUNDLE_DIR/" "$HOST:$REMOTE_BUNDLE_DIR/"
+fi
+
+# 3. Ship repo working copy (if --repo-path was provided).
+# Excludes target/, node_modules/ etc. to keep the copy lean. The agent will
+# work against this copy; changes persist on the server after the run.
+if [[ -n "$REPO_PATH" ]]; then
+  if [[ ! -d "$REPO_PATH" ]]; then
+    echo "error: --repo-path directory not found: $REPO_PATH" >&2
+    exit 1
+  fi
+  log "shipping repo working copy via rsync"
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "  DRY: rsync $REPO_PATH/ → $HOST:$REMOTE_REPO_DIR/"
+  else
+    rsync -az --delete \
+      --exclude 'target/' \
+      --exclude 'node_modules/' \
+      --exclude '.venv/' \
+      --exclude 'dist/' \
+      --exclude 'build/' \
+      --exclude '*.pyc' \
+      "$REPO_PATH/" "$HOST:$REMOTE_REPO_DIR/"
+  fi
 fi
 
 # 3. Emit `dispatched` event locally (if a local run dir was provided).
@@ -239,9 +272,21 @@ else
   USERNS_FLAG="--user 1000:1000"
 fi
 
-# Bundle mount at /workspace/repo is READ-WRITE so the agent can create files,
-# run git, and make commits. The bundle directory on the server becomes the
-# agent's working copy for this run and persists after the container exits.
+# Mount strategy:
+#   /workspace/run   — whole run directory (status.jsonl, heartbeats.jsonl,
+#                      bundle/, repo/, etc.). Read-write.
+#   /workspace/repo  — if --repo-path was set: the rsynced repo working copy,
+#                      read-write so the agent can edit, commit, push.
+#                      Otherwise: falls back to the bundle dir (smoke test mode).
+#
+# The agent reads the requirements from /workspace/run/bundle/requirements.md
+# and works in /workspace/repo.
+if [[ -n "$REPO_PATH" ]]; then
+  REPO_MOUNT="-v $REMOTE_REPO_DIR:/workspace/repo:Z"
+else
+  REPO_MOUNT="-v $REMOTE_BUNDLE_DIR:/workspace/repo:Z"
+fi
+
 container_cmd="$RUNTIME run -d \
   --name oneshot-$RUN_ID \
   $USERNS_FLAG \
@@ -249,7 +294,7 @@ container_cmd="$RUNTIME run -d \
   $GPU_FLAGS \
   $AUTH_MOUNT \
   -v $REMOTE_RUN_DIR:/workspace/run:Z \
-  -v $REMOTE_BUNDLE_DIR:/workspace/repo:Z \
+  $REPO_MOUNT \
   $ENV_FLAGS \
   $IMAGE"
 
