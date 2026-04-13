@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# oneshot-reap
+#
+# Rsyncs a remote Oneshot run directory back to the local archive. Called
+# automatically by `oneshot-dispatch --wait` when a run reaches terminal
+# state, and manually by the operator after a fire-and-forget dispatch.
+#
+# Usage:
+#   oneshot-reap <host> <remote_run_dir> <local_dest>
+#   oneshot-reap <run_id>                              # auto-resolved
+#
+# When called with a single run_id argument, scans ~/.claude/oneshot/*/runs/
+# for a matching directory, reads the `dispatched` event for host and
+# remote_run_dir, and rsyncs.
+#
+# After rsync:
+#   - A `reaped` event is appended to the local status.jsonl
+#   - The status.jsonl merges the local `dispatched` event with the remote
+#     semantic events (no duplication; local already has the dispatched
+#     line, rsync brings in the rest)
+#
+# What gets rsynced:
+#   Everything under the remote run dir, EXCEPT:
+#     - repo/.git/objects/pack/   (large, usually not needed for review)
+#     - Temporary files
+#
+# The repo directory itself IS included so the operator can inspect the
+# agent's changes locally.
+
+set -euo pipefail
+
+log() { printf '[reap] %s\n' "$*"; }
+iso_now() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+usage() {
+  cat <<EOF
+Usage: oneshot-reap <host> <remote_run_dir> <local_dest>
+       oneshot-reap <run_id>
+
+Modes:
+  3-arg mode: explicit host + paths (used by dispatcher --wait)
+  1-arg mode: resolve from local ~/.claude/oneshot/*/runs/<run_id>/
+EOF
+}
+
+if [[ $# -eq 0 ]] || [[ "$1" == "-h" || "$1" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+HOST=""
+REMOTE_RUN_DIR=""
+LOCAL_DEST=""
+
+if [[ $# -eq 1 ]]; then
+  # Resolve mode: find the local run dir by ID, read its dispatched event.
+  RUN_ID="$1"
+  LOCAL_DEST="$(find "$HOME/.claude/oneshot" -maxdepth 4 -type d -name "$RUN_ID" 2>/dev/null | head -1)"
+  if [[ -z "$LOCAL_DEST" ]]; then
+    echo "error: no local run found for run_id: $RUN_ID" >&2
+    exit 1
+  fi
+  status_file="$LOCAL_DEST/status.jsonl"
+  if [[ ! -f "$status_file" ]]; then
+    echo "error: no status.jsonl at $status_file" >&2
+    exit 1
+  fi
+  dispatched=$(grep '"type":"dispatched"' "$status_file" 2>/dev/null | head -1)
+  if [[ -z "$dispatched" ]]; then
+    echo "error: no dispatched event in $status_file" >&2
+    exit 1
+  fi
+  HOST=$(echo "$dispatched" | jq -r '.host // ""')
+  REMOTE_RUN_DIR=$(echo "$dispatched" | jq -r '.remote_run_dir // ""')
+  if [[ -z "$HOST" || -z "$REMOTE_RUN_DIR" ]]; then
+    echo "error: dispatched event missing host or remote_run_dir fields" >&2
+    echo "       $dispatched" >&2
+    exit 1
+  fi
+elif [[ $# -eq 3 ]]; then
+  HOST="$1"
+  REMOTE_RUN_DIR="$2"
+  LOCAL_DEST="$3"
+else
+  usage >&2
+  exit 2
+fi
+
+log "host:       $HOST"
+log "remote:     $REMOTE_RUN_DIR"
+log "local:      $LOCAL_DEST"
+
+mkdir -p "$LOCAL_DEST"
+
+# Rsync the remote run directory back. Trailing slash on source copies
+# contents (not the dir itself). Excludes prune git pack files that bloat
+# the archive without adding review value.
+#
+# Note: we do NOT use --delete here — the local dir may already have the
+# `dispatched` event in status.jsonl that the remote's status.jsonl lacks.
+# Rsync will overwrite status.jsonl with the remote version (which has all
+# the events including running/received/phase/commit/completed), and we
+# handle the merge below.
+rsync -az \
+  --exclude 'repo/.git/objects/pack/' \
+  --exclude 'repo/.git/modules/' \
+  "$HOST:$REMOTE_RUN_DIR/" "$LOCAL_DEST/" 2>&1 | grep -v "WARNING\|post-quantum\|vulnerable" || true
+
+# Re-prepend the `dispatched` event to status.jsonl if it was lost during
+# rsync (the remote doesn't emit it — only the local dispatcher does).
+status_file="$LOCAL_DEST/status.jsonl"
+if [[ -f "$status_file" ]]; then
+  if ! grep -q '"type":"dispatched"' "$status_file"; then
+    # Preserve the dispatched event from any backup we might have.
+    tmp_status="$(mktemp)"
+    if [[ -f "$LOCAL_DEST/.dispatched-backup.jsonl" ]]; then
+      cat "$LOCAL_DEST/.dispatched-backup.jsonl" "$status_file" > "$tmp_status"
+      mv "$tmp_status" "$status_file"
+    fi
+  fi
+fi
+
+# Append a reaped event so the local archive knows when it was reaped.
+reaped=$(jq -nc --arg ts "$(iso_now)" --arg host "$HOST" --arg src "$REMOTE_RUN_DIR" \
+  '{ts:$ts,type:"reaped",source_host:$host,source_dir:$src}')
+printf '%s\n' "$reaped" >> "$status_file"
+
+log "reaped to $LOCAL_DEST"
+
+# Show a quick summary of what came back.
+if [[ -f "$LOCAL_DEST/result.json" ]]; then
+  log ""
+  log "run summary (result.json):"
+  jq -r '"  final_state: \(.final_state)\n  pr_url: \(.pr_url // "none")\n  commits: \(.commits | length)\n  tool_calls: \(.tool_calls)\n  files_touched: \(.files_touched)\n  elapsed: \(.elapsed_s)s"' "$LOCAL_DEST/result.json"
+fi

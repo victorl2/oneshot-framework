@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# oneshot-cancel
+#
+# Abort a running Oneshot run by killing its sandbox container. Resolves
+# the run_id to a host and container id via the local dispatched/received
+# events, then SSHes in and runs `podman kill` (or `docker kill`).
+#
+# The container's EXIT trap catches SIGTERM and emits a terminal event to
+# status.jsonl before the process exits, so the cancellation shows up in
+# the event log.
+#
+# Usage:
+#   oneshot-cancel <run_id>
+#
+# Destructive — confirms before acting unless --force is passed.
+
+set -euo pipefail
+
+FORCE=0
+RUN_ID=""
+REASON=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --force|-f)  FORCE=1; shift ;;
+    --reason)    REASON="$2"; shift 2 ;;
+    -h|--help)
+      sed -n '2,16p' "$0" | sed 's|^# \{0,1\}||'
+      exit 0
+      ;;
+    -*)
+      echo "error: unknown flag: $1" >&2
+      exit 2
+      ;;
+    *)
+      RUN_ID="$1"
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$RUN_ID" ]]; then
+  echo "usage: oneshot-cancel <run_id> [--force] [--reason <text>]" >&2
+  exit 2
+fi
+
+run_dir=$(find "$HOME/.claude/oneshot" -maxdepth 4 -type d -name "$RUN_ID" 2>/dev/null | head -1)
+if [[ -z "$run_dir" ]]; then
+  echo "error: no local run found for: $RUN_ID" >&2
+  exit 1
+fi
+
+# Must have both a dispatched event (for host) and a received event (for container id).
+dispatched=$(grep '"type":"dispatched"' "$run_dir/status.jsonl" 2>/dev/null | head -1)
+if [[ -z "$dispatched" ]]; then
+  echo "error: no dispatched event in $run_dir/status.jsonl — run was never started" >&2
+  exit 1
+fi
+HOST=$(echo "$dispatched" | jq -r '.host // ""')
+REMOTE_RUN_DIR=$(echo "$dispatched" | jq -r '.remote_run_dir // ""')
+
+# The received event may live on the remote if we haven't reaped yet.
+# Fetch it from the server if not already local.
+received=$(grep '"type":"received"' "$run_dir/status.jsonl" 2>/dev/null | head -1)
+if [[ -z "$received" ]]; then
+  received=$(ssh "$HOST" "grep '\"type\":\"received\"' '$REMOTE_RUN_DIR/status.jsonl' 2>/dev/null | head -1" 2>&1 | grep -v WARNING | grep -v "post-quantum" || true)
+fi
+if [[ -z "$received" ]]; then
+  # Fallback: use the container name (convention: oneshot-$RUN_ID)
+  container_id="oneshot-$RUN_ID"
+  echo "[cancel] no received event found — falling back to container name: $container_id" >&2
+else
+  container_id=$(echo "$received" | jq -r '.container_id // ""')
+  if [[ -z "$container_id" ]]; then
+    container_id="oneshot-$RUN_ID"
+  fi
+fi
+
+echo "[cancel] run_id:       $RUN_ID"
+echo "[cancel] host:         $HOST"
+echo "[cancel] container:    $container_id"
+
+if [[ $FORCE -eq 0 ]]; then
+  read -rp "kill this run? [y/N] " ans
+  if [[ "$ans" != "y" && "$ans" != "Y" ]]; then
+    echo "[cancel] aborted by operator"
+    exit 0
+  fi
+fi
+
+# Send SIGTERM (which the entrypoint's EXIT trap catches). Fall back to
+# SIGKILL after a grace period if needed.
+RUNTIME="${ONESHOT_RUNTIME:-podman}"
+echo "[cancel] sending SIGTERM..."
+ssh "$HOST" "$RUNTIME kill --signal=TERM $container_id 2>&1" 2>&1 | grep -v WARNING | grep -v "post-quantum" || true
+
+# Give the EXIT trap 10 seconds to run, then force-kill if still up.
+sleep 5
+still_up=$(ssh "$HOST" "$RUNTIME ps --filter name=$container_id --format '{{.Names}}' 2>/dev/null" 2>&1 | grep -v WARNING | grep -v "post-quantum" || true)
+if [[ -n "$still_up" ]]; then
+  echo "[cancel] container still up after SIGTERM, sending SIGKILL"
+  ssh "$HOST" "$RUNTIME kill $container_id 2>&1" 2>&1 | grep -v WARNING | grep -v "post-quantum" || true
+fi
+
+echo "[cancel] done"
+echo ""
+echo "inspect with: oneshot-status $RUN_ID"

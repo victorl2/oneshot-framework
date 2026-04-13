@@ -35,6 +35,9 @@ Required:
   --host <hostname>          SSH target (e.g. user@host, or hostname)
 
 Optional:
+  --project <slug>           Project slug, used to organize local run dirs
+                             (~/.claude/oneshot/<slug>/runs/<run_id>/).
+                             Default: "scratchpad" for ad-hoc dispatches.
   --run-id <id>              Run identifier (default: r-YYYYMMDD-HHMMSS)
   --volume-root <path>       Server-side volume root (default: ~/oneshot-data)
   --image <name:tag>         Sandbox image (default: oneshot-sandbox:latest)
@@ -48,8 +51,11 @@ Optional:
   --cpu <n>                  CPU limit (default: 4)
   --memory <size>            Memory limit (default: 8g)
   --gpu                      Request GPU passthrough
-  --local-run-dir <path>     Local run dir; if set, dispatched event is
-                             written to <path>/status.jsonl
+  --keep-container           Do not auto-remove the container on exit
+                             (default: container runs with --rm)
+  --wait                     Block until the run reaches a terminal state,
+                             then rsync-back artifacts to local. Without
+                             this flag, dispatch returns immediately.
   --dry-run                  Print what would happen, don't execute
   -h, --help                 Show this help
 
@@ -62,6 +68,7 @@ EOF
 }
 
 HOST=""
+PROJECT="scratchpad"
 RUN_ID=""
 VOLUME_ROOT="~/oneshot-data"
 IMAGE="oneshot-sandbox:latest"
@@ -70,13 +77,15 @@ REPO_PATH=""
 CPU="4"
 MEMORY="8g"
 GPU_FLAGS=""
-LOCAL_RUN_DIR=""
+RM_FLAG="--rm"
+WAIT=0
 DRY_RUN=0
 BUNDLE_DIR=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --host)          HOST="$2"; shift 2 ;;
+    --project)       PROJECT="$2"; shift 2 ;;
     --run-id)        RUN_ID="$2"; shift 2 ;;
     --volume-root)   VOLUME_ROOT="$2"; shift 2 ;;
     --image)         IMAGE="$2"; shift 2 ;;
@@ -85,7 +94,8 @@ while [[ $# -gt 0 ]]; do
     --cpu)           CPU="$2"; shift 2 ;;
     --memory)        MEMORY="$2"; shift 2 ;;
     --gpu)           GPU_FLAGS="--gpus all"; shift ;;
-    --local-run-dir) LOCAL_RUN_DIR="$2"; shift 2 ;;
+    --keep-container) RM_FLAG=""; shift ;;
+    --wait)          WAIT=1; shift ;;
     --dry-run)       DRY_RUN=1; shift ;;
     -h|--help)       usage; exit 0 ;;
     --)              shift; BUNDLE_DIR="$1"; shift ;;
@@ -217,8 +227,13 @@ if [[ -n "$REPO_PATH" ]]; then
   fi
 fi
 
-# 3. Emit `dispatched` event locally (if a local run dir was provided).
-if [[ -n "$LOCAL_RUN_DIR" && $DRY_RUN -eq 0 ]]; then
+# 3. Emit `dispatched` event locally. Always create the local run dir so
+# subsequent tooling (oneshot-status, oneshot-reap, etc.) has a canonical
+# place to look up the run.
+LOCAL_PROJECT_DIR="$HOME/.claude/oneshot/$PROJECT"
+LOCAL_RUN_DIR="$LOCAL_PROJECT_DIR/runs/$RUN_ID"
+
+if [[ $DRY_RUN -eq 0 ]]; then
   mkdir -p "$LOCAL_RUN_DIR"
   local_status="$LOCAL_RUN_DIR/status.jsonl"
   gpu_bool="false"
@@ -227,12 +242,22 @@ if [[ -n "$LOCAL_RUN_DIR" && $DRY_RUN -eq 0 ]]; then
     --arg ts "$(iso_now)" \
     --arg run_id "$RUN_ID" \
     --arg host "$HOST" \
+    --arg project "$PROJECT" \
+    --arg remote_run_dir "$REMOTE_RUN_DIR" \
     --arg cpu "$CPU" \
     --arg memory "$MEMORY" \
     --argjson gpu "$gpu_bool" \
-    '{ts:$ts,type:"dispatched",run_id:$run_id,host:$host,container_spec:{cpu:$cpu,memory:$memory,gpu:$gpu}}')
+    '{
+      ts: $ts,
+      type: "dispatched",
+      run_id: $run_id,
+      host: $host,
+      project: $project,
+      remote_run_dir: $remote_run_dir,
+      container_spec: {cpu: $cpu, memory: $memory, gpu: $gpu}
+    }')
   printf '%s\n' "$dispatched_event" >> "$local_status"
-  log "emitted dispatched → $local_status"
+  log "local run dir: $LOCAL_RUN_DIR"
 fi
 
 # 4. Start the container on the server.
@@ -322,6 +347,7 @@ fi
 
 container_cmd="$RUNTIME run -d \
   --name oneshot-$RUN_ID \
+  $RM_FLAG \
   $USERNS_FLAG \
   $RESOURCE_FLAGS \
   $GPU_FLAGS \
@@ -346,9 +372,48 @@ else
 fi
 
 log "dispatched $RUN_ID"
-log ""
-log "follow progress with:"
-log "  oneshot-status '$HOST' '$REMOTE_RUN_DIR'"
-log ""
-log "stream logs with:"
-log "  ssh '$HOST' tail -f '$REMOTE_RUN_DIR/agent.log'"
+
+# If --wait was requested, poll the remote status.jsonl until a terminal
+# event appears, then reap the run's artifacts back to local.
+if [[ $WAIT -eq 1 && $DRY_RUN -eq 0 ]]; then
+  log ""
+  log "waiting for terminal state..."
+  BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+  poll_interval=10
+  max_wait=3600  # 1 hour ceiling
+  start=$(date +%s)
+  while true; do
+    now=$(date +%s)
+    elapsed=$(( now - start ))
+    if (( elapsed >= max_wait )); then
+      log "error: wait timeout after ${elapsed}s"
+      exit 1
+    fi
+
+    # Check for terminal event.
+    terminal=$(ssh "$HOST" "grep -E '\"type\":\"(completed|failed)\"' '$REMOTE_RUN_DIR/status.jsonl' 2>/dev/null | tail -1")
+    if [[ -n "$terminal" ]]; then
+      final_type=$(echo "$terminal" | jq -r '.type // "unknown"')
+      log "run reached terminal state: $final_type (${elapsed}s)"
+      break
+    fi
+
+    sleep "$poll_interval"
+  done
+
+  # Reap: rsync the remote run dir → local.
+  log "reaping remote run dir → local archive"
+  "$BIN_DIR/oneshot-reap" "$HOST" "$REMOTE_RUN_DIR" "$LOCAL_RUN_DIR" || {
+    log "warning: reap failed, remote artifacts still live on the server"
+  }
+else
+  log ""
+  log "follow progress with:"
+  log "  bin/oneshot-status $RUN_ID"
+  log "  bin/oneshot-watch $RUN_ID"
+  log "  bin/oneshot-logs $RUN_ID"
+  log ""
+  log "reap artifacts manually with:"
+  log "  bin/oneshot-reap '$HOST' '$REMOTE_RUN_DIR' '$LOCAL_RUN_DIR'"
+fi

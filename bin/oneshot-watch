@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# oneshot-watch
+#
+# Live tail a Oneshot run's semantic event stream (status.jsonl), rendering
+# each event as a human-readable line as it arrives. Continues until the
+# run reaches a terminal state or the operator interrupts with Ctrl+C.
+#
+# Deliberately does NOT tail heartbeats.jsonl — that file is compact numeric
+# telemetry for state computation, not for live display. For live "what is
+# it doing right now," we read current.json periodically (constant-size).
+#
+# Usage:
+#   oneshot-watch <run_id>
+
+set -euo pipefail
+
+RUN_ID="${1:-}"
+if [[ -z "$RUN_ID" ]]; then
+  echo "usage: oneshot-watch <run_id>" >&2
+  exit 2
+fi
+
+run_dir=$(find "$HOME/.claude/oneshot" -maxdepth 4 -type d -name "$RUN_ID" 2>/dev/null | head -1)
+if [[ -z "$run_dir" ]]; then
+  echo "error: no local run found for: $RUN_ID" >&2
+  exit 1
+fi
+
+# If already terminal, show the event log and exit.
+if grep -qE '"type":"(completed|failed)"' "$run_dir/status.jsonl" 2>/dev/null; then
+  echo "[watch] run is terminal; showing event log"
+  jq -r '"\(.ts) \(.type)\(if .phase then " → \(.phase)" elif .sha then " \(.sha) \(.message)" elif .url then " \(.url)" elif .reason then " (\(.reason))" else "" end)"' "$run_dir/status.jsonl" 2>/dev/null
+  exit 0
+fi
+
+dispatched=$(grep '"type":"dispatched"' "$run_dir/status.jsonl" 2>/dev/null | head -1)
+if [[ -z "$dispatched" ]]; then
+  echo "error: no dispatched event in $run_dir/status.jsonl" >&2
+  exit 1
+fi
+HOST=$(echo "$dispatched" | jq -r '.host // ""')
+REMOTE_RUN_DIR=$(echo "$dispatched" | jq -r '.remote_run_dir // ""')
+
+if [[ -z "$HOST" || -z "$REMOTE_RUN_DIR" ]]; then
+  echo "error: dispatched event missing host or remote_run_dir" >&2
+  exit 1
+fi
+
+# Stream the remote status.jsonl via `tail -f`, piping through jq to format.
+# Each line in status.jsonl is one event; jq formats it as a readable line.
+exec ssh "$HOST" "tail -F -n +1 '$REMOTE_RUN_DIR/status.jsonl' 2>/dev/null" 2>&1 | \
+  jq -R -r '. as $line | try (fromjson | "\(.ts) \(.type)\(if .phase then " → \(.phase)" elif .sha then " \(.sha) \(.message)" elif .url then " \(.url)" elif .reason then " (\(.reason))" elif .result_summary then " (\(.result_summary))" else "" end)") catch $line'

@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# oneshot-logs
+#
+# Stream a Oneshot run's full agent.log for debugging. Resolves a run_id
+# to host + remote dir via the local dispatched event, then cats or tails
+# the remote agent.log.
+#
+# Usage:
+#   oneshot-logs <run_id>          # cat once
+#   oneshot-logs <run_id> --follow # tail -f until Ctrl+C
+#
+# agent.log is classified as human-only in DESIGN.md §"Storage Topology" —
+# it's not meant to be ingested as agent context.
+
+set -euo pipefail
+
+RUN_ID=""
+FOLLOW=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --follow|-f) FOLLOW=1; shift ;;
+    -h|--help)
+      sed -n '2,14p' "$0" | sed 's|^# \{0,1\}||'
+      exit 0
+      ;;
+    -*)
+      echo "error: unknown flag: $1" >&2
+      exit 2
+      ;;
+    *)
+      RUN_ID="$1"
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$RUN_ID" ]]; then
+  echo "usage: oneshot-logs <run_id> [--follow]" >&2
+  exit 2
+fi
+
+# Resolve local run dir.
+run_dir=$(find "$HOME/.claude/oneshot" -maxdepth 4 -type d -name "$RUN_ID" 2>/dev/null | head -1)
+if [[ -z "$run_dir" ]]; then
+  echo "error: no local run found for: $RUN_ID" >&2
+  exit 1
+fi
+
+# If the run already terminated and was reaped, use the local log.
+local_log="$run_dir/agent.log"
+is_terminal=0
+if [[ -f "$run_dir/status.jsonl" ]]; then
+  if grep -qE '"type":"(completed|failed)"' "$run_dir/status.jsonl"; then
+    is_terminal=1
+  fi
+fi
+
+if [[ $is_terminal -eq 1 && -f "$local_log" ]]; then
+  if [[ $FOLLOW -eq 1 ]]; then
+    echo "[logs] run is terminal; showing final log (--follow no-op)" >&2
+  fi
+  cat "$local_log"
+  exit 0
+fi
+
+# Live run — SSH to remote and cat/tail.
+dispatched=$(grep '"type":"dispatched"' "$run_dir/status.jsonl" 2>/dev/null | head -1)
+if [[ -z "$dispatched" ]]; then
+  echo "error: no dispatched event in $run_dir/status.jsonl" >&2
+  exit 1
+fi
+HOST=$(echo "$dispatched" | jq -r '.host // ""')
+REMOTE_RUN_DIR=$(echo "$dispatched" | jq -r '.remote_run_dir // ""')
+
+if [[ -z "$HOST" || -z "$REMOTE_RUN_DIR" ]]; then
+  echo "error: dispatched event missing host or remote_run_dir" >&2
+  exit 1
+fi
+
+if [[ $FOLLOW -eq 1 ]]; then
+  exec ssh "$HOST" "tail -f '$REMOTE_RUN_DIR/agent.log'"
+else
+  exec ssh "$HOST" "cat '$REMOTE_RUN_DIR/agent.log'"
+fi

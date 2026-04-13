@@ -8,15 +8,6 @@ See [`DESIGN.md`](./DESIGN.md) for the canonical spec — this document tracks t
 
 ---
 
-## 🔴 Blockers for a real repo one-shot task
-
-These must be fixed before the framework can land a PR on a real repo (e.g. iron-lang). Without them, the agent can edit files and commit locally, but cannot push, cannot open a PR, and commits are misattributed.
-
-### 3. No rsync-back mechanism
-**What:** Run artifacts (`status.jsonl`, `heartbeats.jsonl`, `agent.log`, worktree with agent changes) live only on the server. The local side has the `dispatched` event and nothing else.
-**Why:** DESIGN §"Storage Topology" says local is authoritative — at run end, the server-side artifacts should be rsynced to `~/.claude/oneshot/{project}/runs/{timestamp}/`. Without this, the operator can't review run history from their laptop.
-**Fix:** Add a terminal phase to `oneshot-dispatch` (or a new `oneshot-reap` command) that rsyncs the server volume back to the local run dir once the run reaches a terminal state. Could run automatically on `oneshot-status` observing a terminal event.
-
 ---
 
 ## 🟠 Observability gaps (pipeline works, signal incomplete)
@@ -32,8 +23,6 @@ The hook path fires correctly and counters progress over time.
 
 ## 🟡 Untested command paths
 
-Commands exist as documented-but-stubby markdown files. None have been executed end-to-end yet except the dispatch path (which was tested via `bin/oneshot-dispatch`, not via `/oneshot start` as a slash command).
-
 ### 9. `/oneshot:new-project` end-to-end
 **What:** The command markdown describes the flow, but no real project has been initialized through it. Does Claude Code correctly create `~/.claude/oneshot/{slug}/` with the right files? Does GSD artifact detection work?
 **Fix:** Run it on a fresh project (e.g. iron-lang), verify the directory structure, `project.md` seeding, `config.yml` generation.
@@ -41,22 +30,6 @@ Commands exist as documented-but-stubby markdown files. None have been executed 
 ### 10. `/oneshot start` with real scorer/discuss subagents
 **What:** The command now orchestrates `oneshot-discuss` + `oneshot-scorer` via Task, but this orchestration has never actually run. Does Claude Code spawn them correctly? Does the scorer's JSON output get parsed? Does the score display work? Does plateau detection fire?
 **Fix:** Run `/oneshot start` on a real task and walk through the full discuss loop manually.
-
-### 11. `/oneshot status` command
-**What:** The markdown describes scanning `~/.claude/oneshot/*/runs/` locally and polling remote runs, but no real implementation exists. Running `/oneshot status` today just opens the markdown in Claude Code — no logic fires.
-**Fix:** Implement the actual status-scanning logic (as a shell script in `bin/` that the command invokes, same pattern as `bin/oneshot-dispatch`).
-
-### 12. `/oneshot watch <run_id>` command
-**What:** Same as #11 — describes SSH tail + current.json polling, not implemented.
-**Fix:** Create `bin/oneshot-watch` that does the SSH tail loop and renders events.
-
-### 13. `/oneshot logs <run_id>` command
-**What:** Same — describes `agent.log` streaming, not implemented.
-**Fix:** Create `bin/oneshot-logs` wrapping `ssh host tail -f`.
-
-### 14. `/oneshot cancel <run_id>` command
-**What:** Same — describes SSH + `docker kill` / `podman kill`, not implemented.
-**Fix:** Create `bin/oneshot-cancel` that resolves run_id → container via status.jsonl's `received` event, then kills.
 
 ### 15. `/oneshot iterate <PR>` command
 **What:** Restart-the-cycle command, entirely unimplemented. Requires: PR context gathering, re-entering discuss with existing requirements as baseline, dispatching against the same branch.
@@ -146,10 +119,6 @@ loginctl terminate-user victor
 **Why:** Server disk usage grows unbounded as runs accumulate.
 **Fix:** Create `bin/oneshot-server-gc` that checks which runs have been successfully rsynced back to local (requires #3 first) and prunes anything beyond the grace period. Conservative defaults.
 
-### 29. Container cleanup on failure
-**What:** When a run fails, the container stays around on the server (exited state). Cleanup is manual via `podman rm -f`.
-**Why:** Stale containers clutter `podman ps -a` output and consume minor disk.
-**Fix:** Dispatcher can run containers with `--rm` flag so they auto-remove on exit. Need to make sure the volume (run dir) survives — `--rm` only removes the container layer, not mounted volumes.
 
 ---
 
@@ -194,19 +163,16 @@ loginctl terminate-user victor
 
 ## Priority ordering for closing gaps before real iron-lang test
 
-Minimum to unblock a real iron-lang task landing a PR:
+Everything on the pre-test priority list is now closed:
 1. ~~**#1 GitHub auth in container**~~ ✅ closed
 2. ~~**#2 Git identity**~~ ✅ closed
-3. ~~**#4 Phase tracking**~~ ✅ closed
-4. ~~**#6 + #7 + #8 Final heartbeat/result.json**~~ ✅ closed
+3. ~~**#3 Rsync-back**~~ ✅ closed
+4. ~~**#4 Phase tracking**~~ ✅ closed
+5. ~~**#6 + #7 + #8 Final heartbeat/result.json**~~ ✅ closed
+6. ~~**#11-14 Status/watch/logs/cancel commands**~~ ✅ closed
+7. ~~**#29 Container auto-cleanup**~~ ✅ closed
 
-**Remaining blocker**: #3 Rsync-back is nice-to-have but not strictly required for the first real test — runs just live on the server until we add it.
-
-Nice-to-have before real test but not strictly required:
-- **#11-14 Status/watch/logs/cancel commands** (convenience during the run)
-
-Defer until after first real task:
-- Everything else (#15–34)
+The framework is ready for a real iron-lang task. Remaining gaps (#5, #9, #10, #15, #16-34) are either deeper features (PR reviewer, discussion sandbox) or polish items that don't block the happy path.
 
 ---
 
@@ -231,6 +197,34 @@ Defer until after first real task:
 ### ✅ #8 result.json summary
 **Closed in:** commit `fceedf7` (2026-04-13)
 **Resolution:** Entrypoint cleanup trap calls `write_result_json()` which parses `status.jsonl` for terminal state, PR URL, and commit shas, then writes a compact summary: `{run_id, final_state, pr_url, commits[], tool_calls, files_touched, elapsed_s, written_at}`. Verified locally in the demo run.
+
+### ✅ #3 Rsync-back mechanism
+**Closed on:** 2026-04-13 (in the "#11-14 commands" commit below)
+**Resolution:** New `bin/oneshot-reap` script rsyncs the server-persistent run dir to local `~/.claude/oneshot/{project}/runs/{run_id}/`. Two invocation modes: explicit `<host> <remote_dir> <local_dest>` and lookup `<run_id>` (reads the dispatched event for host/remote info). Excludes `repo/.git/objects/pack/` to keep the archive lean. Appends a `reaped` event to local `status.jsonl`. Called automatically by `oneshot-dispatch --wait` on terminal, and by `oneshot-status` when it detects a run reaching terminal state.
+
+### ✅ #11 `/oneshot status`
+**Closed on:** 2026-04-13
+**Resolution:** `bin/oneshot-status` scans `~/.claude/oneshot/*/runs/` and renders a table (project, run_id, state, phase, elapsed, hb_ago, pr). For still-live runs, a single SSH call fetches the remote `status.jsonl` + `current.json` and derives state. Terminal runs auto-reap on detection. Default view hides terminals; `--all` shows them. Single-run detail mode (`oneshot-status <run_id>`) renders the full event timeline. Verified end-to-end.
+
+### ✅ #12 `/oneshot watch`
+**Closed on:** 2026-04-13
+**Resolution:** `bin/oneshot-watch <run_id>` resolves to host+remote dir from the local dispatched event, then `tail -F`s the remote `status.jsonl` piped through `jq` to render each event as a human-readable line. If the run is already terminal locally, shows the merged event log. Deliberately does NOT tail `heartbeats.jsonl` (per DESIGN §5 — that's compact telemetry, not live display).
+
+### ✅ #13 `/oneshot logs`
+**Closed on:** 2026-04-13
+**Resolution:** `bin/oneshot-logs <run_id>` streams `agent.log` over SSH (or cats local if already reaped). `--follow` flag for `tail -f` mode. Simple wrapper.
+
+### ✅ #14 `/oneshot cancel`
+**Closed on:** 2026-04-13
+**Resolution:** `bin/oneshot-cancel <run_id>` resolves run to host + container id via dispatched/received events, confirms with the operator (unless `--force`), sends SIGTERM to let the entrypoint's EXIT trap emit a clean terminal event, then escalates to SIGKILL after a grace period if still running. The container's cleanup path writes the `failed: cancelled` event.
+
+### ✅ #29 Container auto-cleanup
+**Closed on:** 2026-04-13
+**Resolution:** Dispatcher now runs containers with `--rm` flag by default, so Podman removes the container on exit. Volume mounts (run dir, repo, auth) persist because they're bind mounts, not container layers. `--keep-container` flag preserves the container if needed for debugging.
+
+### ✅ Dispatcher `--wait` flag
+**Closed on:** 2026-04-13 (companion to #3)
+**Resolution:** `--wait` blocks after dispatch, polls the remote status.jsonl for a terminal event, then calls `oneshot-reap` to pull artifacts back to local. Prints a summary from `result.json` at the end. Ties the synchronous dispatch→done flow into a single command.
 
 ---
 

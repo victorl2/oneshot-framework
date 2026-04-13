@@ -1,103 +1,227 @@
 #!/usr/bin/env bash
 # oneshot-status
 #
-# Minimal remote status reader. Given a host and a remote run directory,
-# SSHes in and prints a one-shot summary of the run's state:
-#   - latest event type from status.jsonl
-#   - current phase and activity from current.json
-#   - elapsed time and tool-call count
-#
-# This is the smallest tool that can follow along with a dispatched run.
-# The future `/oneshot status` slash command will build on top of this to
-# scan all local projects and render a multi-run table.
+# Show the state of Oneshot runs. Scans ~/.claude/oneshot/*/runs/ for all
+# dispatched runs, polls each via SSH (if still active), and renders a
+# table. With a <run_id> argument, shows a detail view for one run.
 #
 # Usage:
-#   oneshot-status <host> <remote_run_dir>
+#   oneshot-status                 # table of all runs
+#   oneshot-status <run_id>        # detail view for one run
+#   oneshot-status --all           # include terminal runs in the table
+#   oneshot-status --no-reap       # skip auto-reap of terminal runs
 #
-# Required on the operator's machine: ssh, jq
-#
-# See DESIGN.md §5 (Progress Tracker).
+# State derivation:
+#   - Runs with a local `completed` or `failed` event are terminal, shown
+#     from local data (no SSH).
+#   - Runs without are still live on the server: SSH to fetch status.jsonl
+#     and current.json, compute state.
+#   - If a poll detects a run has just reached terminal state, it's
+#     auto-reaped (unless --no-reap) so subsequent calls see it locally.
 
-set -euo pipefail
+set -o pipefail
+# NOTE: deliberately NOT using -e or -u because many grep/jq/ssh calls
+# legitimately return non-zero or reference unset vars (empty data, remote
+# unreachable, events not yet present) and we want to handle those as
+# "no data available" rather than abort.
 
-if [[ $# -lt 2 ]]; then
-  cat <<EOF >&2
-Usage: oneshot-status <host> <remote_run_dir>
+ALL=0
+NO_REAP=0
+QUERY_RUN_ID=""
 
-Example:
-  oneshot-status workstation.local /var/lib/oneshot/runs/r-20260410-143000
-EOF
-  exit 2
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --all)     ALL=1; shift ;;
+    --no-reap) NO_REAP=1; shift ;;
+    -h|--help)
+      sed -n '2,20p' "$0" | sed 's|^# \{0,1\}||'
+      exit 0
+      ;;
+    -*)
+      echo "error: unknown flag: $1" >&2
+      exit 2
+      ;;
+    *)
+      QUERY_RUN_ID="$1"
+      shift
+      ;;
+  esac
+done
+
+log() { printf '[status] %s\n' "$*"; }
+
+ONESHOT_ROOT="$HOME/.claude/oneshot"
+if [[ ! -d "$ONESHOT_ROOT" ]]; then
+  echo "no oneshot projects found at $ONESHOT_ROOT"
+  exit 0
 fi
 
-HOST="$1"
-REMOTE_DIR="$2"
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Fetch status.jsonl (semantic events) and current.json in a single SSH call
-# to minimize latency. If a file doesn't exist yet, we get an empty string.
-read_output="$(ssh "$HOST" bash -s <<EOF
+# Read the local status.jsonl + (if non-terminal) a remote fetch.
+# Sets globals: PROJECT, RUN_ID, STATE, PHASE, ACT, ELAPSED, HB_AGO, PR, FIX_ATTEMPTS
+read_run_state() {
+  local run_dir="$1"
+  PROJECT=$(basename "$(dirname "$(dirname "$run_dir")")")
+  RUN_ID=$(basename "$run_dir")
+
+  local local_status="$run_dir/status.jsonl"
+  local state="unknown" phase="?" act="?" elapsed="?" hb_ago="?" pr="—"
+
+  if [[ ! -f "$local_status" ]]; then
+    STATE="$state"; PHASE="$phase"; ACT="$act"; ELAPSED="$elapsed"; HB_AGO="$hb_ago"; PR="$pr"
+    return
+  fi
+
+  # Start with local data.
+  local has_terminal
+  has_terminal=$(grep -oE '"type":"(completed|failed)"' "$local_status" | tail -1 | sed 's/.*"type":"//; s/"//')
+
+  # Terminal runs — read from local files.
+  if [[ -n "$has_terminal" ]]; then
+    state="$has_terminal"
+    if [[ -f "$run_dir/result.json" ]]; then
+      pr=$(jq -r '.pr_url // "—"' "$run_dir/result.json" 2>/dev/null || echo "—")
+      elapsed=$(jq -r '.elapsed_s // 0' "$run_dir/result.json" 2>/dev/null || echo 0)
+    fi
+    if [[ -f "$run_dir/current.json" ]]; then
+      phase=$(jq -r '.phase // "?"' "$run_dir/current.json" 2>/dev/null || echo "?")
+      act=$(jq -r '.act // "?"' "$run_dir/current.json" 2>/dev/null || echo "?")
+    else
+      # Grab phase from last phase event
+      phase=$(grep '"type":"phase"' "$local_status" | tail -1 | jq -r '.phase // "?"' 2>/dev/null || echo "?")
+    fi
+  else
+    # Live run — need to SSH the remote.
+    local dispatched=$(grep '"type":"dispatched"' "$local_status" | head -1)
+    if [[ -z "$dispatched" ]]; then
+      state="no-dispatched-event"
+      STATE="$state"; PHASE="$phase"; ACT="$act"; ELAPSED="$elapsed"; HB_AGO="$hb_ago"; PR="$pr"
+      return
+    fi
+    local host=$(echo "$dispatched" | jq -r '.host // ""')
+    local remote_run_dir=$(echo "$dispatched" | jq -r '.remote_run_dir // ""')
+
+    if [[ -z "$host" || -z "$remote_run_dir" ]]; then
+      state="missing-remote-info"
+      STATE="$state"; PHASE="$phase"; ACT="$act"; ELAPSED="$elapsed"; HB_AGO="$hb_ago"; PR="$pr"
+      return
+    fi
+
+    # Single SSH call for both status.jsonl and current.json.
+    local payload
+    payload=$(ssh "$host" bash -s <<EOF 2>/dev/null
 set -e
-run_dir='$REMOTE_DIR'
+rd='$remote_run_dir'
 printf '__STATUS_START__\n'
-[[ -f "\$run_dir/status.jsonl" ]] && cat "\$run_dir/status.jsonl"
+[[ -f "\$rd/status.jsonl" ]] && cat "\$rd/status.jsonl"
 printf '__STATUS_END__\n'
 printf '__CURRENT_START__\n'
-[[ -f "\$run_dir/current.json" ]] && cat "\$run_dir/current.json"
+[[ -f "\$rd/current.json" ]] && cat "\$rd/current.json"
 printf '__CURRENT_END__\n'
 EOF
-)"
+) || true
 
-status_events="$(awk '/__STATUS_START__/{flag=1;next} /__STATUS_END__/{flag=0} flag' <<<"$read_output")"
-current_json="$(awk '/__CURRENT_START__/{flag=1;next} /__CURRENT_END__/{flag=0} flag' <<<"$read_output")"
+    local remote_status=$(awk '/__STATUS_START__/{flag=1;next} /__STATUS_END__/{flag=0} flag' <<<"$payload")
+    local remote_current=$(awk '/__CURRENT_START__/{flag=1;next} /__CURRENT_END__/{flag=0} flag' <<<"$payload")
 
-# Derive "last event type" from the last line of status.jsonl (if any).
-if [[ -n "$status_events" ]]; then
-  last_event="$(printf '%s\n' "$status_events" | tail -1)"
-  last_type="$(jq -r '.type // "unknown"' <<<"$last_event")"
-else
-  last_type="(no status.jsonl yet)"
-fi
+    if [[ -n "$remote_status" ]]; then
+      has_terminal=$(echo "$remote_status" | grep -oE '"type":"(completed|failed)"' | tail -1 | sed 's/.*"type":"//; s/"//')
+      if [[ -n "$has_terminal" ]]; then
+        state="$has_terminal"
+      else
+        # Derive liveness from current.json freshness (if present) + last heartbeat.
+        state="running"
+      fi
+      # Extract pr url if any pr_opened event.
+      local pr_event=$(echo "$remote_status" | grep '"type":"pr_opened"' | tail -1)
+      if [[ -n "$pr_event" ]]; then
+        pr=$(echo "$pr_event" | jq -r '.url // "—"')
+      fi
+    else
+      state="not-yet-running"
+    fi
 
-# Derive live state from current.json (if present).
-if [[ -n "$current_json" ]]; then
-  phase="$(jq -r '.phase // "unknown"' <<<"$current_json")"
-  act="$(jq -r '.act // "unknown"' <<<"$current_json")"
-  elapsed="$(jq -r '.e // 0' <<<"$current_json")"
-  tool_calls="$(jq -r '.tc // 0' <<<"$current_json")"
-  tokens="$(jq -r '.tk // 0' <<<"$current_json")"
-  files="$(jq -r '.ft // 0' <<<"$current_json")"
-  subagents_active="$(jq -r '.sa // 0' <<<"$current_json")"
-else
-  phase="(no current.json yet)"
-  act=""
-  elapsed=0
-  tool_calls=0
-  tokens=0
-  files=0
-  subagents_active=0
-fi
+    if [[ -n "$remote_current" ]]; then
+      phase=$(echo "$remote_current" | jq -r '.phase // "?"' 2>/dev/null || echo "?")
+      act=$(echo "$remote_current" | jq -r '.act // "?"' 2>/dev/null || echo "?")
+      elapsed=$(echo "$remote_current" | jq -r '.e // 0' 2>/dev/null || echo 0)
+      local current_ts
+      current_ts=$(echo "$remote_current" | jq -r '.ts // 0' 2>/dev/null || echo 0)
+      if [[ "$current_ts" != "0" ]]; then
+        hb_ago=$(( $(date +%s) - current_ts ))
+      fi
+    fi
 
-# Count events per type for a compact summary.
-if [[ -n "$status_events" ]]; then
-  event_summary="$(printf '%s\n' "$status_events" \
-    | jq -r '.type' 2>/dev/null \
-    | sort \
-    | uniq -c \
-    | awk '{printf "%s(%s) ", $2, $1}')"
-else
-  event_summary="(none)"
-fi
+    # If we just detected a terminal state and --no-reap wasn't set, auto-reap.
+    if [[ -n "$has_terminal" && $NO_REAP -eq 0 ]]; then
+      "$BIN_DIR/oneshot-reap" "$host" "$remote_run_dir" "$run_dir" >/dev/null 2>&1 || true
+    fi
+  fi
 
-cat <<EOF
-host:       $HOST
-run dir:    $REMOTE_DIR
-last event: $last_type
-phase:      $phase
-activity:   $act
-elapsed:    ${elapsed}s
-tool calls: $tool_calls
-tokens:     $tokens
-files:      $files
-subagents:  $subagents_active active
-events:     $event_summary
+  STATE="$state"
+  PHASE="$phase"
+  ACT="$act"
+  ELAPSED="$elapsed"
+  HB_AGO="$hb_ago"
+  PR="$pr"
+}
+
+# Render a single run's state as one table row.
+render_row() {
+  local run_dir="$1"
+  read_run_state "$run_dir"
+
+  # Skip terminal runs in default view.
+  if [[ $ALL -eq 0 && ("$STATE" == "completed" || "$STATE" == "failed") ]]; then
+    return
+  fi
+
+  printf '%-12s %-24s %-13s %-13s %7s %6s %s\n' \
+    "$PROJECT" "$RUN_ID" "$STATE" "$PHASE" "${ELAPSED}s" "${HB_AGO}s" "$PR"
+}
+
+# Single-run detail view.
+if [[ -n "$QUERY_RUN_ID" ]]; then
+  match=$(find "$ONESHOT_ROOT" -maxdepth 4 -type d -name "$QUERY_RUN_ID" 2>/dev/null | head -1)
+  if [[ -z "$match" ]]; then
+    echo "error: no run found for: $QUERY_RUN_ID" >&2
+    exit 1
+  fi
+  read_run_state "$match"
+  cat <<EOF
+project:    $PROJECT
+run_id:     $RUN_ID
+state:      $STATE
+phase:      $PHASE
+activity:   $ACT
+elapsed:    ${ELAPSED}s
+last hb:    ${HB_AGO}s ago
+pr:         $PR
+local dir:  $match
 EOF
+  # Show event timeline from local status.jsonl (now merged with remote via auto-reap).
+  if [[ -f "$match/status.jsonl" ]]; then
+    echo ""
+    echo "events:"
+    jq -r '"  [\(.ts)] \(.type)\(if .phase then " → \(.phase)" elif .sha then " \(.sha) \(.message)" elif .url then " \(.url)" else "" end)"' "$match/status.jsonl" 2>/dev/null
+  fi
+  exit 0
+fi
+
+# Table header.
+printf '%-12s %-24s %-13s %-13s %7s %6s %s\n' \
+  "PROJECT" "RUN_ID" "STATE" "PHASE" "ELAPSED" "HB_AGO" "PR"
+printf '%.0s-' {1..100}
+echo
+
+# Walk all project run dirs and render rows.
+count=0
+while IFS= read -r run_dir; do
+  render_row "$run_dir"
+  count=$(( count + 1 ))
+done < <(find "$ONESHOT_ROOT" -maxdepth 3 -type d -path '*/runs/*' 2>/dev/null | sort -r)
+
+if [[ $count -eq 0 ]]; then
+  echo "(no runs found — dispatch one with bin/oneshot-dispatch)"
+fi
