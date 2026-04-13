@@ -67,11 +67,12 @@ RUN chmod +x /usr/local/bin/oneshot-entrypoint \
 RUN useradd -m -u 1000 -s /bin/bash oneshot
 
 # Volume mount points:
-#   /workspace/run         — server-persistent volume (status.jsonl, heartbeats.jsonl,
-#                            current.json, agent.log, result.json)
-#   /workspace/repo        — git worktree (dispatched bundle or repo clone)
-#   /home/oneshot/.claude  — Claude Code auth + config mounted from the host user
-RUN mkdir -p /workspace/run /workspace/repo /home/oneshot/.claude \
+#   /workspace/run             — server-persistent volume (status.jsonl, heartbeats.jsonl,
+#                                current.json, agent.log, result.json)
+#   /workspace/repo            — git worktree (dispatched bundle or repo clone)
+#   /home/oneshot/.claude      — Claude Code auth + config mounted from the host user
+#   /home/oneshot/.config/gh   — GitHub CLI auth mounted from the host user
+RUN mkdir -p /workspace/run /workspace/repo /home/oneshot/.claude /home/oneshot/.config/gh \
     && chown -R oneshot:oneshot /workspace /home/oneshot
 
 ENV ONESHOT_RUN_DIR=/workspace/run \

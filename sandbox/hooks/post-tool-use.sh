@@ -41,11 +41,40 @@ fi
 
 tool_name="$(echo "$payload" | jq -r '.tool_name // ""')"
 
+# Current phase for monotonic transitions below (only advances, never goes back).
+current_phase="$(jq -r '.phase // "booting"' "$COUNTERS_FILE" 2>/dev/null || echo booting)"
+
+# Heuristic phase transitions based on tool patterns. Rules:
+#   booting → exploring   on first Read/Grep/Glob
+#   exploring → implementing on first Edit/Write/MultiEdit
+#   implementing → testing  on Bash matching test-runner patterns
+#   (any) → reviewing    on git commit
+#
+# Monotonic: once past a phase, never regress (implementing stays
+# implementing even if the agent runs more Reads).
+advance_phase() {
+  local new="$1"
+  case "$current_phase:$new" in
+    booting:exploring|booting:implementing|booting:testing|booting:reviewing) ;;
+    exploring:implementing|exploring:testing|exploring:reviewing) ;;
+    implementing:testing|implementing:reviewing) ;;
+    testing:reviewing) ;;
+    *) return 0 ;;  # no transition allowed
+  esac
+  oneshot_phase "$new"
+  current_phase="$new"
+}
+
 case "$tool_name" in
+  Read|Grep|Glob)
+    advance_phase "exploring"
+    ;;
+
   Edit|Write|MultiEdit)
     # File-touching tools. Bump files_touched (rough count — doesn't dedupe
     # repeat edits of the same file, which is fine for a progress signal).
     oneshot_counters_inc "files_touched"
+    advance_phase "implementing"
     ;;
 
   Task)
@@ -66,14 +95,21 @@ case "$tool_name" in
     stdout="$(echo "$payload" | jq -r '.tool_response.stdout // ""')"
     stderr="$(echo "$payload" | jq -r '.tool_response.stderr // ""')"
 
-    # git commit — extract sha from stdout (git prints "[branch sha] message"
-    # on commit success; the short sha is the second word inside brackets).
-    if [[ "$cmd" == *"git commit"* ]]; then
+    # Test runner detection → phase transition to testing.
+    # Matches: cargo test, npm test, pytest, go test, make test, yarn test, jest, vitest
+    if echo "$cmd" | grep -qE '(cargo test|npm test|pytest|go test|make test|yarn test|jest|vitest|pnpm test)'; then
+      advance_phase "testing"
+    fi
+
+    # git commit — extract sha via git rev-parse (more reliable than
+    # parsing the bracketed git output, which varies between versions).
+    if [[ "$cmd" == *"git commit"* ]] && [[ "$stderr" != *"nothing to commit"* ]]; then
       sha="$(echo "$stdout" | grep -oE '\[[^]]+\]' | head -1 | sed -E 's/.* ([0-9a-f]{7,40})\]/\1/')"
       # Best-effort message extraction from the commit command itself.
       msg="$(echo "$cmd" | sed -n 's/.*-m *["'\''"]\([^"'\'']*\).*/\1/p' | head -1)"
       if [[ -n "$sha" ]]; then
         oneshot_commit "$sha" "${msg:-"(unknown message)"}"
+        advance_phase "reviewing"
       fi
     fi
 

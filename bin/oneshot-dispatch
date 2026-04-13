@@ -251,15 +251,44 @@ if [[ -n "${ONESHOT_BUDGET_USD:-}" ]]; then
   ENV_FLAGS="$ENV_FLAGS -e ONESHOT_BUDGET_USD=$ONESHOT_BUDGET_USD"
 fi
 
-# Auth: mount the server user's ~/.claude/ into the container so the agent
-# inherits the Claude Code subscription login. This avoids needing a separate
-# API key — the container uses the same OAuth session as `claude` on the server.
-# Must be read-write because Claude Code writes session state, cache, and
-# telemetry to ~/.claude/. The container runs as the same UID as the host
-# user (via --userns=keep-id) so this is the user's own directory.
+# Resolve git identity from the operator's local env so commits made by the
+# sandbox agent are attributed to the human, not a synthetic localhost user.
+# Falls back to GIT_AUTHOR_NAME/EMAIL env vars if git config isn't set.
+GIT_NAME="${GIT_AUTHOR_NAME:-$(git config --global user.name 2>/dev/null || true)}"
+GIT_EMAIL="${GIT_AUTHOR_EMAIL:-$(git config --global user.email 2>/dev/null || true)}"
+if [[ -n "$GIT_NAME" ]]; then
+  ENV_FLAGS="$ENV_FLAGS -e ONESHOT_GIT_NAME=$GIT_NAME"
+  log "git identity: $GIT_NAME <$GIT_EMAIL>"
+fi
+if [[ -n "$GIT_EMAIL" ]]; then
+  ENV_FLAGS="$ENV_FLAGS -e ONESHOT_GIT_EMAIL=$GIT_EMAIL"
+fi
+
+# Auth mounts: pass operator's credential directories from the server user
+# into the container so the agent can authenticate against Claude + GitHub
+# without dispatcher-managed secrets.
+#
+# Claude Code auth   (~/.claude/):           OAuth session for subscription
+# GitHub CLI auth    (~/.config/gh/):        git push + gh pr create
+#
+# Both are mounted read-write under the non-root 'oneshot' user's home in
+# the container. The host UID maps to the container UID via --userns=keep-id,
+# so these are the operator's own files either way.
 REMOTE_HOME="$(ssh "$HOST" 'echo $HOME')"
-AUTH_MOUNT="-v ${REMOTE_HOME}/.claude:/home/oneshot/.claude:Z"
-log "auth mount:  ${REMOTE_HOME}/.claude → /home/oneshot/.claude (subscription, rw)"
+CLAUDE_MOUNT="-v ${REMOTE_HOME}/.claude:/home/oneshot/.claude:Z"
+log "auth mount:  ${REMOTE_HOME}/.claude → /home/oneshot/.claude (claude, rw)"
+
+# GitHub CLI auth — check if the server user has a gh config directory
+# before mounting. Skip with a warning if not (smoke tests don't need it;
+# real PR-opening tasks do).
+GH_MOUNT=""
+if ssh "$HOST" "[[ -d ${REMOTE_HOME}/.config/gh ]]" 2>/dev/null; then
+  GH_MOUNT="-v ${REMOTE_HOME}/.config/gh:/home/oneshot/.config/gh:Z"
+  log "auth mount:  ${REMOTE_HOME}/.config/gh → /home/oneshot/.config/gh (github, rw)"
+else
+  log "auth mount:  NO gh config found on server — agent cannot push/PR"
+  log "             run: ssh -t $HOST 'gh auth login' (if gh installed)"
+fi
 
 # User namespace mapping. Claude Code refuses --dangerously-skip-permissions
 # as root, so the container runs as a non-root 'oneshot' user (UID 1000).
@@ -292,7 +321,8 @@ container_cmd="$RUNTIME run -d \
   $USERNS_FLAG \
   $RESOURCE_FLAGS \
   $GPU_FLAGS \
-  $AUTH_MOUNT \
+  $CLAUDE_MOUNT \
+  $GH_MOUNT \
   -v $REMOTE_RUN_DIR:/workspace/run:Z \
   $REPO_MOUNT \
   $ENV_FLAGS \
