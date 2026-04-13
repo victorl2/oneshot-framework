@@ -254,14 +254,18 @@ fi
 # Resolve git identity from the operator's local env so commits made by the
 # sandbox agent are attributed to the human, not a synthetic localhost user.
 # Falls back to GIT_AUTHOR_NAME/EMAIL env vars if git config isn't set.
+#
+# Values may contain spaces (e.g. "Victor Ferreira") so they must be
+# shell-escaped with printf %q before being concatenated into the container
+# command — otherwise word-splitting breaks the `podman run` invocation.
 GIT_NAME="${GIT_AUTHOR_NAME:-$(git config --global user.name 2>/dev/null || true)}"
 GIT_EMAIL="${GIT_AUTHOR_EMAIL:-$(git config --global user.email 2>/dev/null || true)}"
 if [[ -n "$GIT_NAME" ]]; then
-  ENV_FLAGS="$ENV_FLAGS -e ONESHOT_GIT_NAME=$GIT_NAME"
+  ENV_FLAGS="$ENV_FLAGS -e ONESHOT_GIT_NAME=$(printf '%q' "$GIT_NAME")"
   log "git identity: $GIT_NAME <$GIT_EMAIL>"
 fi
 if [[ -n "$GIT_EMAIL" ]]; then
-  ENV_FLAGS="$ENV_FLAGS -e ONESHOT_GIT_EMAIL=$GIT_EMAIL"
+  ENV_FLAGS="$ENV_FLAGS -e ONESHOT_GIT_EMAIL=$(printf '%q' "$GIT_EMAIL")"
 fi
 
 # Auth mounts: pass operator's credential directories from the server user

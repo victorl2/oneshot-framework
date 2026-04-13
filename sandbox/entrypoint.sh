@@ -193,14 +193,26 @@ elif [[ -f "$RUN_DIR/bundle/requirements.md" ]]; then
   # vars (ONESHOT_GIT_NAME / ONESHOT_GIT_EMAIL) set by the dispatcher from
   # the operator's local git config. Falls back to a clearly-synthetic
   # identity if none provided (smoke tests, missing config).
-  git config --global user.name "${ONESHOT_GIT_NAME:-oneshot-agent}"
-  git config --global user.email "${ONESHOT_GIT_EMAIL:-oneshot@localhost}"
+  GIT_NAME="${ONESHOT_GIT_NAME:-oneshot-agent}"
+  GIT_EMAIL="${ONESHOT_GIT_EMAIL:-oneshot@localhost}"
+
+  git config --global user.name  "$GIT_NAME"
+  git config --global user.email "$GIT_EMAIL"
   git config --global init.defaultBranch main
 
   # Safe directory for the mounted repo (rootless Podman with keep-id maps
   # the volume owner correctly, but git can still complain about ownership
   # differences when paths are bind-mounted).
   git config --global --add safe.directory /workspace/repo
+
+  # Git env vars override any repo-local user.name/user.email config. Crucial
+  # when the rsynced repo has its own .git/config with stale identity — those
+  # values would otherwise shadow the operator's identity on commits made by
+  # the agent.
+  export GIT_AUTHOR_NAME="$GIT_NAME"
+  export GIT_AUTHOR_EMAIL="$GIT_EMAIL"
+  export GIT_COMMITTER_NAME="$GIT_NAME"
+  export GIT_COMMITTER_EMAIL="$GIT_EMAIL"
 
   claude \
     --print \
