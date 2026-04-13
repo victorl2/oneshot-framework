@@ -1,6 +1,6 @@
 # GAPS.md — Known gaps, unimplemented features, and untested paths
 
-**Status as of 2026-04-13** — after verifying the PostToolUse hook path end-to-end on silvaserver.local.
+**Status as of 2026-04-13** — after closing gap blockers #1, #2, #4, #6, #7, #8. See the "Closed" section at the bottom.
 
 This document inventories everything that's **not yet working** or **not yet tested** before we start exercising real-world tasks. Ordered by severity. Each entry has: what's missing, why it matters, and a rough fix approach. When a gap is closed, move it to a `## Closed` section at the bottom (or just delete the entry if trivial).
 
@@ -12,16 +12,6 @@ See [`DESIGN.md`](./DESIGN.md) for the canonical spec — this document tracks t
 
 These must be fixed before the framework can land a PR on a real repo (e.g. iron-lang). Without them, the agent can edit files and commit locally, but cannot push, cannot open a PR, and commits are misattributed.
 
-### 1. GitHub auth in the container
-**What:** The container has `gh` CLI installed but no credentials. `gh pr create` and `git push` against GitHub both fail.
-**Why:** The entire CI Gate + PR Reviewer + Iterate flows depend on a PR existing. Without `gh` auth, the agent can't complete the contract.
-**Fix:** Add a `gh` auth mount alongside the Claude auth mount — either mount `~/.config/gh/` from the server user into the container, or pass `GH_TOKEN`/`GITHUB_TOKEN` via env var from the dispatcher. Recommendation: mount `~/.config/gh/` — matches the Claude auth pattern, no token handling in the dispatcher.
-
-### 2. Git identity for commits
-**What:** The container's entrypoint hardcodes `git config --global user.name "oneshot-agent"` and `user.email "oneshot@localhost"`. Commits made by the agent are misattributed to this synthetic identity.
-**Why:** Commits landing in real repos should carry the operator's identity (or at minimum a clearly-marked identity tied to the run), not a fake localhost email.
-**Fix:** Dispatcher resolves `git config --global user.name` / `user.email` from the operator's local environment and passes them as env vars (`GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, etc.). Entrypoint sets these instead of the hardcoded values.
-
 ### 3. No rsync-back mechanism
 **What:** Run artifacts (`status.jsonl`, `heartbeats.jsonl`, `agent.log`, worktree with agent changes) live only on the server. The local side has the `dispatched` event and nothing else.
 **Why:** DESIGN §"Storage Topology" says local is authoritative — at run end, the server-side artifacts should be rsynced to `~/.claude/oneshot/{project}/runs/{timestamp}/`. Without this, the operator can't review run history from their laptop.
@@ -31,35 +21,12 @@ These must be fixed before the framework can land a PR on a real repo (e.g. iron
 
 ## 🟠 Observability gaps (pipeline works, signal incomplete)
 
-The hook path fires correctly and counters progress over time, but three fields in the telemetry are dead or wrong.
-
-### 4. Phase field never updates for real runs
-**What:** The `phase` field in `.counters` and `current.json` stays at `"booting"` for the entire run. Only the demo-agent calls `oneshot_phase` to transition through `exploring → implementing → testing → ...`. Real Claude Code agents have no mechanism to update it.
-**Why:** `/oneshot status` and `/oneshot watch` show "booting" even when the agent is actively implementing or committing. Misleading — looks like the run is stuck.
-**Fix (two options):**
-- **(A) Infer from tool patterns**: update `post-tool-use.sh` to set phase based on tool name (Read→exploring, first Edit/Write→implementing, Bash matching `*test*`→testing, Bash matching `git commit`→reviewing). Heuristic but zero agent burden.
-- **(B) Explicit phase file**: add a `Update phase file at X when transitioning` instruction to the sandbox `system-prompt.md`. Cleaner semantics but adds cognitive load to the agent.
-- Recommendation: start with (A), layer in (B) if heuristic is too noisy.
+The hook path fires correctly and counters progress over time.
 
 ### 5. Token usage not tracked
 **What:** `tokens_used_total` always reports 0. Claude Code's `PostToolUse` payload doesn't include token counts. The scorer and calibration would benefit from this data.
 **Why:** Budget monitoring (`/oneshot status` showing cost), calibration delta analysis (cost vs quality), and cost caps all need real token numbers.
 **Fix:** Check whether `Stop` hook or `--output-format stream-json` exposes token counts. If the former: update `hooks/stop.sh` to parse and emit. If the latter: process the stream in the entrypoint instead of calling `claude --print` naively.
-
-### 6. Heartbeat sidecar killed mid-sleep loses final heartbeat
-**What:** The sidecar sleeps between iterations. When the entrypoint's EXIT trap kills it, any elapsed time since the last tick is lost. Short runs (<interval) only get the e=0 heartbeat.
-**Why:** The final `.counters` state looks frozen at the last heartbeat tick, not the true end-of-run state. Misleading for short runs.
-**Fix:** In the entrypoint's cleanup trap, emit one final heartbeat AFTER killing the sidecar — just write one more compact line to `heartbeats.jsonl` with the final counter values from `.counters`.
-
-### 7. elapsed_s frozen in final counters file
-**What:** After the sidecar dies, nothing updates `elapsed_s` in `.counters`. The post-run file shows `elapsed_s: 0` on short runs or the last sidecar tick on longer ones.
-**Why:** Reading `.counters` post-run gives stale elapsed time.
-**Fix:** Same as #6 — the final heartbeat in cleanup should update `.counters.elapsed_s` before shutting down.
-
-### 8. `result.json` not written
-**What:** DESIGN §5 specifies a `result.json` summary written at terminal state (`completed`/`failed`) with PR URL, SHAs, and summary. Not implemented.
-**Why:** `/oneshot status` could answer "did this succeed and where's the PR" without re-parsing `status.jsonl`.
-**Fix:** In the entrypoint's cleanup trap, extract PR URL and commit shas from `status.jsonl` semantic events and write a compact `result.json`.
 
 ---
 
@@ -228,17 +195,42 @@ loginctl terminate-user victor
 ## Priority ordering for closing gaps before real iron-lang test
 
 Minimum to unblock a real iron-lang task landing a PR:
-1. **#1 GitHub auth in container** (hard blocker)
-2. **#2 Git identity** (commits misattributed otherwise)
-3. **#4 Phase tracking** (observability — makes status useful)
-4. **#6 + #7 + #8 Final heartbeat/result.json** (terminal state clarity)
+1. ~~**#1 GitHub auth in container**~~ ✅ closed
+2. ~~**#2 Git identity**~~ ✅ closed
+3. ~~**#4 Phase tracking**~~ ✅ closed
+4. ~~**#6 + #7 + #8 Final heartbeat/result.json**~~ ✅ closed
+
+**Remaining blocker**: #3 Rsync-back is nice-to-have but not strictly required for the first real test — runs just live on the server until we add it.
 
 Nice-to-have before real test but not strictly required:
-5. **#3 Rsync-back** (operator can inspect after run completes)
-6. **#11-14 Status/watch/logs/cancel commands** (convenience during the run)
+- **#11-14 Status/watch/logs/cancel commands** (convenience during the run)
 
 Defer until after first real task:
 - Everything else (#15–34)
+
+---
+
+## Closed
+
+### ✅ #1 GitHub auth in container
+**Closed in:** commit `fceedf7` (2026-04-13)
+**Resolution:** Dispatcher detects `~/.config/gh/` on the server, mounts it at `/home/oneshot/.config/gh` rw with `:Z` labels. Logs a warning with setup command if absent. Dockerfile creates the mount target. Verified locally via `make test-sandbox`.
+
+### ✅ #2 Git identity
+**Closed in:** commit `fceedf7` (2026-04-13)
+**Resolution:** Dispatcher resolves operator's local `git config --global user.name/email` (or `GIT_AUTHOR_*` env vars) and passes as `ONESHOT_GIT_NAME` / `ONESHOT_GIT_EMAIL`. Entrypoint sets git global config from those env vars. Falls back to synthetic identity only if both unset. Also adds `/workspace/repo` as a git `safe.directory` to avoid ownership warnings on bind-mounted volumes.
+
+### ✅ #4 Phase tracking via heuristic
+**Closed in:** commit `fceedf7` (2026-04-13)
+**Resolution:** PostToolUse hook now transitions phase monotonically based on tool patterns: Read/Grep/Glob→exploring, Edit/Write/MultiEdit→implementing, Bash matching test-runners→testing, git commit→reviewing. `advance_phase()` enforces monotonicity — subsequent Reads don't regress the phase back.
+
+### ✅ #6 + #7 Final heartbeat + elapsed_s update
+**Closed in:** commit `fceedf7` (2026-04-13)
+**Resolution:** Entrypoint cleanup trap calls `emit_final_heartbeat()` after killing the sidecar. Writes one final compact line to `heartbeats.jsonl` and updates `.counters.elapsed_s` to the real post-run elapsed time. Verified locally: demo run now ends with e=15 final tick instead of stopping at the last sidecar iteration.
+
+### ✅ #8 result.json summary
+**Closed in:** commit `fceedf7` (2026-04-13)
+**Resolution:** Entrypoint cleanup trap calls `write_result_json()` which parses `status.jsonl` for terminal state, PR URL, and commit shas, then writes a compact summary: `{run_id, final_state, pr_url, commits[], tool_calls, files_touched, elapsed_s, written_at}`. Verified locally in the demo run.
 
 ---
 
